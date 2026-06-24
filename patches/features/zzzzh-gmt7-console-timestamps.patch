@@ -1,0 +1,86 @@
+diff --git a/open-sse/services/combo.js b/open-sse/services/combo.js
+index 2bb21c4..e8d5efb 100644
+--- a/open-sse/services/combo.js
++++ b/open-sse/services/combo.js
+@@ -17,6 +17,24 @@ const TOOL_CALL_PREFIX = "[Called tools: ";
+ const TOOL_RESULT_PREFIX = "[Tool result: ";
+ const comboModelCooldowns = new Map();
+ const DEFAULT_COMBO_MODEL_COOLDOWN_MS = 30_000;
++const CONSOLE_TIME_ZONE = "Asia/Ho_Chi_Minh";
++const consoleTimeFormatter = new Intl.DateTimeFormat("sv-SE", {
++  timeZone: CONSOLE_TIME_ZONE,
++  year: "numeric",
++  month: "2-digit",
++  day: "2-digit",
++  hour: "2-digit",
++  minute: "2-digit",
++  second: "2-digit",
++  hour12: false,
++});
++
++function formatConsoleTimeGmt7(value) {
++  if (!value) return value;
++  const date = new Date(value);
++  if (Number.isNaN(date.getTime())) return value;
++  return `${consoleTimeFormatter.format(date)} GMT+7`;
++}
+ 
+ function resolveComboModelCooldownMs() {
+   const raw = globalThis.process?.env?.COMBO_MODEL_COOLDOWN_MS;
+@@ -326,7 +344,7 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
+     const cooldownUntil = getComboCooldownUntil(modelStr);
+     if (cooldownUntil > Date.now()) {
+       summary.skipped++;
+-      log.info("COMBO", `${comboLogPrefix} | skip cooldown model=${modelStr} until=${new Date(cooldownUntil).toISOString()}`);
++      log.info("COMBO", `${comboLogPrefix} | skip cooldown model=${modelStr} until=${formatConsoleTimeGmt7(cooldownUntil)}`);
+       continue;
+     }
+     summary.tried++;
+@@ -393,7 +411,7 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
+       if (isPreflightTimeoutText(errorText)) {
+         const cooldownUntil = markComboCooldown(modelStr);
+         if (cooldownUntil) {
+-          log.warn("COMBO", `${comboLogPrefix} | cooldown model=${modelStr} until=${new Date(cooldownUntil).toISOString()} reason=preflight_timeout`, { status: result.status });
++          log.warn("COMBO", `${comboLogPrefix} | cooldown model=${modelStr} until=${formatConsoleTimeGmt7(cooldownUntil)} reason=preflight_timeout`, { status: result.status });
+         }
+       }
+ 
+diff --git a/src/sse/services/auth.js b/src/sse/services/auth.js
+index 5e8208f..fb8be1b 100644
+--- a/src/sse/services/auth.js
++++ b/src/sse/services/auth.js
+@@ -5,6 +5,25 @@ import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
+ import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
+ import * as log from "../utils/logger.js";
+ 
++const CONSOLE_TIME_ZONE = "Asia/Ho_Chi_Minh";
++const consoleTimeFormatter = new Intl.DateTimeFormat("sv-SE", {
++  timeZone: CONSOLE_TIME_ZONE,
++  year: "numeric",
++  month: "2-digit",
++  day: "2-digit",
++  hour: "2-digit",
++  minute: "2-digit",
++  second: "2-digit",
++  hour12: false,
++});
++
++function formatConsoleTimeGmt7(value) {
++  if (!value) return value;
++  const date = new Date(value);
++  if (Number.isNaN(date.getTime())) return value;
++  return `${consoleTimeFormatter.format(date)} GMT+7`;
++}
++
+ // Mutex to prevent race conditions during account selection
+ let selectionMutex = Promise.resolve();
+ 
+@@ -73,7 +92,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
+       const locked = isModelLockActive(c, model);
+       if (excluded || locked) {
+         const lockUntil = getEarliestModelLockUntil(c);
+-        log.debug("AUTH", `  → ${c.id?.slice(0, 8)} | ${excluded ? "excluded" : ""} ${locked ? `modelLocked(${model}) until ${lockUntil}` : ""}`);
++        log.debug("AUTH", `  → ${c.id?.slice(0, 8)} | ${excluded ? "excluded" : ""} ${locked ? `modelLocked(${model}) until ${formatConsoleTimeGmt7(lockUntil)}` : ""}`);
+       }
+     });
+ 

@@ -1,0 +1,53 @@
+diff --git a/src/shared/components/ModelSelectModal.js b/src/shared/components/ModelSelectModal.js
+index 911dd60..92dcda3 100644
+--- a/src/shared/components/ModelSelectModal.js
++++ b/src/shared/components/ModelSelectModal.js
+@@ -249,9 +249,28 @@ export default function ModelSelectModal({
+             value: `${nodePrefix}/${fullModel.replace(`${providerId}/`, "")}`,
+           }));
+ 
++        // Include models registered via /api/models/custom for this compatible provider,
++        // so imported models (e.g. gemini-3.5-flash on a compatible node) appear in the combo selector.
++        const customRegisteredModels = customModels
++          .filter((m) => m?.providerAlias === providerId && m.id && (!m.type || m.type === "llm"))
++          .map((m) => ({
++            id: String(m.id).trim(),
++            name: m.name || String(m.id).trim(),
++            value: `${nodePrefix}/${String(m.id).trim()}`,
++            isCustom: true,
++          }));
++
++        const mergedModels = [...nodeModels, ...customRegisteredModels];
++        const seenValues = new Set();
++        const uniqueModels = mergedModels.filter((model) => {
++          if (seenValues.has(model.value)) return false;
++          seenValues.add(model.value);
++          return true;
++        });
++
+         // Always show compatible providers that are connected, even with no aliases.
+         // When no aliases exist, show a placeholder so users know it's available.
+-        const modelsToShow = nodeModels.length > 0 ? nodeModels : [{
++        const modelsToShow = uniqueModels.length > 0 ? uniqueModels : [{
+           id: `__placeholder__${providerId}`,
+           name: `${nodePrefix}/model-id`,
+           value: `${nodePrefix}/model-id`,
+@@ -264,7 +283,7 @@ export default function ModelSelectModal({
+           color: providerInfo.color,
+           models: modelsToShow,
+           isCustom: true,
+-          hasModels: nodeModels.length > 0,
++          hasModels: uniqueModels.length > 0,
+         };
+       } else {
+         const hardcodedModels = getModelsByProviderId(providerId);
+@@ -365,7 +384,8 @@ export default function ModelSelectModal({
+         models = models.filter(
+           (m) =>
+             m.name.toLowerCase().includes(query) ||
+-            m.id.toLowerCase().includes(query)
++            m.id.toLowerCase().includes(query) ||
++            m.value.toLowerCase().includes(query)
+         );
+         if (models.length === 0 && !providerNameMatches) return;
+       }

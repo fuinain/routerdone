@@ -1,0 +1,2683 @@
+diff --git a/open-sse/config/errorConfig.js b/open-sse/config/errorConfig.js
+index 71491a4..f3ec79b 100644
+--- a/open-sse/config/errorConfig.js
++++ b/open-sse/config/errorConfig.js
+@@ -38,6 +38,9 @@ export const BACKOFF_CONFIG = {
+ // Default cooldown for transient/unknown errors
+ export const TRANSIENT_COOLDOWN_MS = 30 * 1000;
+ 
++// Short account/provider cooldown for busy or concurrency gates.
++export const BUSY_CONNECTION_COOLDOWN_MS = 30 * 1000;
++
+ // Hard cap for provider-reported rate limit cooldown (e.g. codex resets_at can be 5-6h)
+ export const MAX_RATE_LIMIT_COOLDOWN_MS = 30 * 60 * 1000;
+ 
+@@ -61,6 +64,14 @@ export const ERROR_RULES = [
+   { text: "no credentials",           cooldownMs: COOLDOWN.long },
+   { text: "request not allowed",      cooldownMs: COOLDOWN.short },
+   { text: "improperly formed request", cooldownMs: COOLDOWN.long },
++  { text: "hệ thống đang bận",        cooldownMs: BUSY_CONNECTION_COOLDOWN_MS },
++  { text: "system busy",              cooldownMs: BUSY_CONNECTION_COOLDOWN_MS },
++  { text: "try again later",          cooldownMs: BUSY_CONNECTION_COOLDOWN_MS },
++  { text: "please wait",              cooldownMs: BUSY_CONNECTION_COOLDOWN_MS },
++  { text: "pool limit",               cooldownMs: BUSY_CONNECTION_COOLDOWN_MS },
++  { text: "maximum concurrent requests", cooldownMs: BUSY_CONNECTION_COOLDOWN_MS },
++  { text: "too many in-flight",       cooldownMs: BUSY_CONNECTION_COOLDOWN_MS },
++  { text: "in-flight requests",       cooldownMs: BUSY_CONNECTION_COOLDOWN_MS },
+   { text: "rate limit",               backoff: true },
+   { text: "too many requests",        backoff: true },
+   { text: "quota exceeded",           backoff: true },
+diff --git a/open-sse/config/runtimeConfig.js b/open-sse/config/runtimeConfig.js
+index aeacd2d..b06f98b 100644
+--- a/open-sse/config/runtimeConfig.js
++++ b/open-sse/config/runtimeConfig.js
+@@ -45,6 +45,22 @@ export const STREAM_STALL_TIMEOUT_MS = envMs("STREAM_STALL_TIMEOUT_MS", 360 * 10
+ 
+ // Time-to-first-token timeout (prompt prefill). Env: STREAM_FIRST_CHUNK_TIMEOUT_MS.
+ export const STREAM_FIRST_CHUNK_TIMEOUT_MS = envMs("STREAM_FIRST_CHUNK_TIMEOUT_MS", 200 * 1000);
++export const COMBO_STREAM_FIRST_CHUNK_TIMEOUT_MS = envMs("COMBO_STREAM_FIRST_CHUNK_TIMEOUT_MS", 8 * 1000);
++
++export const DIRECT_STREAM_FIRST_BYTE_TIMEOUT_MS = envMs("DIRECT_STREAM_FIRST_BYTE_TIMEOUT_MS", 10 * 1000);
++export const DIRECT_STREAM_FIRST_PRODUCTIVE_TIMEOUT_MS = envMs("DIRECT_STREAM_FIRST_PRODUCTIVE_TIMEOUT_MS", 90 * 1000);
++export const DIRECT_STREAM_IDLE_AFTER_PRODUCTIVE_MS = envMs("DIRECT_STREAM_IDLE_AFTER_PRODUCTIVE_MS", 180 * 1000);
++export const DIRECT_STREAM_TOTAL_BUDGET_MS = envMs("DIRECT_STREAM_TOTAL_BUDGET_MS", 360 * 1000);
++
++export const COMBO_STREAM_FIRST_BYTE_TIMEOUT_MS = envMs("COMBO_STREAM_FIRST_BYTE_TIMEOUT_MS", 3 * 1000);
++export const COMBO_STREAM_FIRST_PRODUCTIVE_TIMEOUT_MS = envMs("COMBO_STREAM_FIRST_PRODUCTIVE_TIMEOUT_MS", 8 * 1000);
++export const COMBO_STREAM_IDLE_AFTER_PRODUCTIVE_MS = envMs("COMBO_STREAM_IDLE_AFTER_PRODUCTIVE_MS", 120 * 1000);
++export const COMBO_STREAM_TOTAL_BUDGET_MS = envMs("COMBO_STREAM_TOTAL_BUDGET_MS", 300 * 1000);
++
++export const FUSION_STREAM_FIRST_BYTE_TIMEOUT_MS = envMs("FUSION_STREAM_FIRST_BYTE_TIMEOUT_MS", 3 * 1000);
++export const FUSION_STREAM_FIRST_PRODUCTIVE_TIMEOUT_MS = envMs("FUSION_STREAM_FIRST_PRODUCTIVE_TIMEOUT_MS", 6 * 1000);
++export const FUSION_STREAM_IDLE_AFTER_PRODUCTIVE_MS = envMs("FUSION_STREAM_IDLE_AFTER_PRODUCTIVE_MS", 60 * 1000);
++export const FUSION_STREAM_TOTAL_BUDGET_MS = envMs("FUSION_STREAM_TOTAL_BUDGET_MS", 90 * 1000);
+ 
+ // Fetch connect timeout: abort if upstream doesn't return response headers within this duration
+ export const FETCH_CONNECT_TIMEOUT_MS = envMs("FETCH_CONNECT_TIMEOUT_MS", 60 * 1000);
+diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
+index d93eb65..f1bce86 100644
+--- a/open-sse/handlers/chatCore.js
++++ b/open-sse/handlers/chatCore.js
+@@ -11,6 +11,7 @@ import { PROVIDERS } from "../config/providers.js";
+ import { createErrorResult, parseUpstreamError, formatProviderError } from "../utils/error.js";
+ import { HTTP_STATUS } from "../config/runtimeConfig.js";
+ import { handleBypassRequest } from "../utils/bypassHandler.js";
++import { resolveRoutePolicy } from "../services/routePolicy.js";
+ import { trackPendingRequest, appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
+ import { getExecutor } from "../executors/index.js";
+ import { buildRequestDetail, extractRequestConfig } from "./chatCore/requestDetail.js";
+@@ -34,9 +35,14 @@ import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
+  * @param {object} options.credentials - Provider credentials
+  * @param {string} options.sourceFormatOverride - Override detected source format (e.g. "openai-responses")
+  */
+-export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, sourceFormatOverride, providerThinking }) {
++export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, sourceFormatOverride, providerThinking, routeInfo = null, streamTimeoutPolicy = null, streamPreflightTimeoutMs = null }) {
+   const { provider, model } = modelInfo;
+   const requestStartTime = Date.now();
++  const routeMode = routeInfo?.routeMode || (routeInfo?.comboName ? "combo" : "direct");
++  const resolvedStreamPolicy = resolveRoutePolicy(routeMode, { stream: streamTimeoutPolicy, streamPreflightTimeoutMs }).stream;
++  const headersDeadlineMs = routeMode === "direct"
++    ? null
++    : (resolvedStreamPolicy.firstByteTimeoutMs || 3000) + (resolvedStreamPolicy.firstProductiveTimeoutMs || 8000);
+ 
+   const sourceFormat = sourceFormatOverride || detectFormat(body);
+ 
+@@ -229,6 +235,15 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+ 
+   // Execute request
+   let providerResponse, providerUrl, providerHeaders, finalBody;
++  let headersTimer = null;
++  let upstreamHeadersTimedOut = false;
++  if (headersDeadlineMs) {
++    headersTimer = setTimeout(() => {
++      upstreamHeadersTimedOut = true;
++      log?.warn?.("STREAM", `${provider?.toUpperCase?.() || provider} | ${model} | upstream headers timeout (${headersDeadlineMs}ms)`);
++      try { streamController.abort(); } catch {}
++    }, headersDeadlineMs);
++  }
+   try {
+     const result = await executor.execute({ model, body: translatedBody, stream, credentials, signal: streamController.signal, log, proxyOptions });
+     providerResponse = result.response;
+@@ -236,11 +251,13 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+     providerHeaders = result.headers;
+     finalBody = result.transformedBody;
+     reqLogger.logTargetRequest(providerUrl, providerHeaders, finalBody);
++    if (headersTimer) { clearTimeout(headersTimer); headersTimer = null; }
+   } catch (error) {
++    if (headersTimer) { clearTimeout(headersTimer); headersTimer = null; }
+     trackPendingRequest(model, provider, connectionId, false, true);
+     appendRequestLog({ model, provider, connectionId, status: `FAILED ${error.name === "AbortError" ? 499 : HTTP_STATUS.BAD_GATEWAY}` }).catch(() => { });
+     saveRequestDetail(buildRequestDetail({
+-      provider, model, connectionId,
++      provider, model, connectionId, routeInfo,
+       latency: { ttft: 0, total: Date.now() - requestStartTime },
+       tokens: { prompt_tokens: 0, completion_tokens: 0 },
+       request: extractRequestConfig(body, stream),
+@@ -251,6 +268,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+ 
+     if (error.name === "AbortError") {
+       streamController.handleError(error);
++      if (upstreamHeadersTimedOut) return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Upstream headers timeout");
+       return createErrorResult(499, "Request aborted");
+     }
+     const errMsg = formatProviderError(error, provider, model, HTTP_STATUS.BAD_GATEWAY);
+@@ -286,7 +304,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+     const { statusCode, message, resetsAtMs } = await parseUpstreamError(providerResponse, executor);
+     appendRequestLog({ model, provider, connectionId, status: `FAILED ${statusCode}` }).catch(() => { });
+     saveRequestDetail(buildRequestDetail({
+-      provider, model, connectionId,
++      provider, model, connectionId, routeInfo,
+       latency: { ttft: 0, total: Date.now() - requestStartTime },
+       tokens: { prompt_tokens: 0, completion_tokens: 0 },
+       request: extractRequestConfig(body, stream),
+@@ -301,7 +319,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+     return createErrorResult(statusCode, errMsg, resetsAtMs);
+   }
+ 
+-  const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess };
++  const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, routeInfo };
+   const appendLog = (extra) => appendRequestLog({ model, provider, connectionId, ...extra }).catch(() => { });
+   const trackDone = () => trackPendingRequest(model, provider, connectionId, false);
+ 
+@@ -320,7 +338,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+ 
+   // Streaming response
+   const { onStreamComplete } = buildOnStreamComplete({ ...sharedCtx });
+-  return handleStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, streamController, onStreamComplete });
++  return handleStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, streamController, onStreamComplete, log, streamTimeoutPolicy: resolvedStreamPolicy });
+ }
+ 
+ export function isTokenExpiringSoon(expiresAt, bufferMs = 5 * 60 * 1000) {
+diff --git a/open-sse/handlers/chatCore/nonStreamingHandler.js b/open-sse/handlers/chatCore/nonStreamingHandler.js
+index d161005..7ac2c75 100644
+--- a/open-sse/handlers/chatCore/nonStreamingHandler.js
++++ b/open-sse/handlers/chatCore/nonStreamingHandler.js
+@@ -140,10 +140,29 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
+   return responseBody;
+ }
+ 
++
++function hasProductiveResponse(body) {
++  if (!body || typeof body !== "object") return false;
++  const choice = body.choices?.[0];
++  const msg = choice?.message || choice?.delta || {};
++  if (typeof msg.content === "string" && msg.content.length > 0) return true;
++  if (typeof msg.reasoning_content === "string" && msg.reasoning_content.length > 0) return true;
++  if (typeof msg.refusal === "string" && msg.refusal.length > 0) return true;
++  if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) return true;
++  if (typeof choice?.text === "string" && choice.text.length > 0) return true;
++  if (Array.isArray(body.content) && body.content.some((b) => typeof b?.text === "string" && b.text.length > 0)) return true;
++  if (Array.isArray(body.output)) {
++    return body.output.some((o) => o?.type === "function_call" || (Array.isArray(o.content) && o.content.some((c) => typeof c?.text === "string" && c.text.length > 0)));
++  }
++  const parts = body.candidates?.[0]?.content?.parts || body.response?.candidates?.[0]?.content?.parts;
++  if (Array.isArray(parts) && parts.some((p) => typeof p.text === "string" && p.text.length > 0 || p.functionCall)) return true;
++  return false;
++}
++
+ /**
+  * Handle non-streaming response from provider.
+  */
+-export async function handleNonStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, trackDone, appendLog }) {
++export async function handleNonStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, trackDone, appendLog, routeInfo }) {
+   trackDone();
+   const contentType = providerResponse.headers.get("content-type") || "";
+   let responseBody;
+@@ -167,14 +186,13 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
+   }
+ 
+   reqLogger.logProviderResponse(providerResponse.status, providerResponse.statusText, providerResponse.headers, responseBody);
+-  if (onRequestSuccess) await onRequestSuccess();
+ 
+   // Decloak tool_use names once on raw Claude body, before any translation (INPUT side)
+   responseBody = decloakToolNames(responseBody, toolNameMap);
+ 
+   const usage = extractUsageFromResponse(responseBody);
+   appendLog({ tokens: usage, status: "200 OK" });
+-  saveUsageStats({ provider, model, tokens: usage, connectionId, apiKey, endpoint: clientRawRequest?.endpoint });
++  saveUsageStats({ provider, model, tokens: usage, connectionId, apiKey, endpoint: clientRawRequest?.endpoint, routeInfo });
+ 
+   const translatedResponse = needsTranslation(targetFormat, sourceFormat)
+     ? translateNonStreamingResponse(responseBody, targetFormat, sourceFormat)
+@@ -215,11 +233,18 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
+     }
+   }
+ 
++  if (!hasProductiveResponse(translatedResponse)) {
++    appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
++    return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Empty upstream response before content");
++  }
++
++  if (onRequestSuccess) await onRequestSuccess();
++
+   reqLogger.logConvertedResponse(translatedResponse);
+ 
+   const totalLatency = Date.now() - requestStartTime;
+   saveRequestDetail(buildRequestDetail({
+-    provider, model, connectionId,
++    provider, model, connectionId, routeInfo,
+     latency: { ttft: totalLatency, total: totalLatency },
+     tokens: usage || { prompt_tokens: 0, completion_tokens: 0 },
+     request: extractRequestConfig(body, stream),
+diff --git a/open-sse/handlers/chatCore/requestDetail.js b/open-sse/handlers/chatCore/requestDetail.js
+index d9dde1a..a62d63c 100644
+--- a/open-sse/handlers/chatCore/requestDetail.js
++++ b/open-sse/handlers/chatCore/requestDetail.js
+@@ -67,12 +67,16 @@ export function buildRequestDetail(base, overrides = {}) {
+     providerRequest: base.providerRequest || null,
+     providerResponse: base.providerResponse || null,
+     response: base.response || {},
++    requestedModel: base.routeInfo?.requestedModel || base.requestedModel || base.request?.model || base.model || "unknown",
++    attemptModel: base.routeInfo?.attemptModel || base.attemptModel || base.request?.model || base.model || "unknown",
++    actualModel: base.routeInfo?.actualModel || base.actualModel || base.model || "unknown",
++    routeInfo: base.routeInfo || null,
+     status: base.status || "success",
+     ...overrides
+   };
+ }
+ 
+-export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, endpoint, label = "USAGE" }) {
++export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, endpoint, label = "USAGE", routeInfo = null }) {
+   if (!tokens || typeof tokens !== "object") return;
+ 
+   const inTokens = tokens.input_tokens ?? tokens.prompt_tokens ?? 0;
+@@ -97,6 +101,7 @@ export function saveUsageStats({ provider, model, tokens, connectionId, apiKey,
+     timestamp: new Date().toISOString(),
+     connectionId: connectionId || undefined,
+     apiKey: apiKey || undefined,
+-    endpoint: endpoint || null
++    endpoint: endpoint || null,
++    meta: routeInfo || null
+   }).catch(() => {});
+ }
+diff --git a/open-sse/handlers/chatCore/sseToJsonHandler.js b/open-sse/handlers/chatCore/sseToJsonHandler.js
+index 1e0edeb..b642abd 100644
+--- a/open-sse/handlers/chatCore/sseToJsonHandler.js
++++ b/open-sse/handlers/chatCore/sseToJsonHandler.js
+@@ -98,11 +98,25 @@ export function parseSSEToOpenAIResponse(rawSSE, fallbackModel) {
+   return result;
+ }
+ 
++
++function hasProductiveJsonResponse(body) {
++  if (!body || typeof body !== "object") return false;
++  const choice = body.choices?.[0];
++  const msg = choice?.message || choice?.delta || {};
++  if (typeof msg.content === "string" && msg.content.length > 0) return true;
++  if (typeof msg.reasoning_content === "string" && msg.reasoning_content.length > 0) return true;
++  if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) return true;
++  if (Array.isArray(body.output)) {
++    return body.output.some((o) => o?.type === "function_call" || (Array.isArray(o.content) && o.content.some((c) => typeof c?.text === "string" && c.text.length > 0)));
++  }
++  return false;
++}
++
+ /**
+  * Handle case: provider forced streaming but client wants JSON.
+  * Supports both Codex/Responses API SSE and standard Chat Completions SSE.
+  */
+-export async function handleForcedSSEToJson({ providerResponse, sourceFormat, provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, trackDone, appendLog }) {
++export async function handleForcedSSEToJson({ providerResponse, sourceFormat, provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, trackDone, appendLog, routeInfo }) {
+   const contentType = providerResponse.headers.get("content-type") || "";
+   const isSSE = contentType.includes("text/event-stream") || (contentType === "" && isResponsesProvider(provider));
+   if (!isSSE) return null; // not handled here
+@@ -120,11 +134,12 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, pr
+   if (isCodexResponsesApi) {
+     try {
+       const jsonResponse = await convertResponsesStreamToJson(providerResponse.body);
++      if (!hasProductiveJsonResponse(jsonResponse)) return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Empty upstream stream before content");
+       if (onRequestSuccess) await onRequestSuccess();
+ 
+       const usage = jsonResponse.usage || {};
+       appendLog({ tokens: usage, status: "200 OK" });
+-      saveUsageStats({ provider, model, tokens: usage, connectionId, apiKey, endpoint: clientRawRequest?.endpoint });
++      saveUsageStats({ provider, model, tokens: usage, connectionId, apiKey, endpoint: clientRawRequest?.endpoint, routeInfo });
+ 
+       const { msgItem, textContent } = pickAssistantMessageForChatCompletion(jsonResponse.output);
+       const totalLatency = Date.now() - requestStartTime;
+@@ -196,11 +211,12 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, pr
+     const parsed = parseSSEToOpenAIResponse(sseText, model);
+     if (!parsed) return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Invalid SSE response for non-streaming request");
+ 
++    if (!hasProductiveJsonResponse(parsed)) return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Empty upstream stream before content");
+     if (onRequestSuccess) await onRequestSuccess();
+ 
+     const usage = parsed.usage || {};
+     appendLog({ tokens: usage, status: "200 OK" });
+-    saveUsageStats({ provider, model, tokens: usage, connectionId, apiKey, endpoint: clientRawRequest?.endpoint });
++    saveUsageStats({ provider, model, tokens: usage, connectionId, apiKey, endpoint: clientRawRequest?.endpoint, routeInfo });
+ 
+     const totalLatency = Date.now() - requestStartTime;
+     saveRequestDetail(buildRequestDetail({
+diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
+index aa907cd..c200a06 100644
+--- a/open-sse/handlers/chatCore/streamingHandler.js
++++ b/open-sse/handlers/chatCore/streamingHandler.js
+@@ -2,15 +2,15 @@ import { FORMATS } from "../../translator/formats.js";
+ import { needsTranslation } from "../../translator/index.js";
+ import { createSSETransformStreamWithLogger, createPassthroughStreamWithLogger } from "../../utils/stream.js";
+ import { pipeWithDisconnect } from "../../utils/streamHandler.js";
++import { parseSSELine } from "../../utils/streamHelpers.js";
+ import { PROVIDERS } from "../../config/providers.js";
+-import { STREAM_STALL_TIMEOUT_MS } from "../../config/runtimeConfig.js";
++import { HTTP_STATUS } from "../../config/runtimeConfig.js";
+ import { buildAbortedResponsesTerminalBytes } from "../../utils/responsesStreamHelpers.js";
++import { createErrorResult } from "../../utils/error.js";
+ import { buildRequestDetail, extractRequestConfig, saveUsageStats } from "./requestDetail.js";
+ import { saveRequestDetail } from "@/lib/usageDb.js";
+ import { SSE_HEADERS_CORS as SSE_HEADERS } from "../../utils/sseConstants.js";
+ 
+-// Codex returns Responses API SSE → which client format to translate INTO, by request sourceFormat.
+-// Gemini-family all map to ANTIGRAVITY decoder; unknown sources fall back to OPENAI.
+ const CODEX_SOURCE_TO_TARGET = {
+   [FORMATS.OPENAI_RESPONSES]: FORMATS.OPENAI_RESPONSES,
+   [FORMATS.CLAUDE]: FORMATS.CLAUDE,
+@@ -19,44 +19,154 @@ const CODEX_SOURCE_TO_TARGET = {
+   [FORMATS.GEMINI_CLI]: FORMATS.ANTIGRAVITY,
+ };
+ 
+-/**
+- * Determine which SSE transform stream to use based on provider/format.
+- */
++function hasText(value) {
++  return typeof value === "string" && value.length > 0;
++}
++
++function hasNonEmptyObject(value) {
++  return value && typeof value === "object" && Object.keys(value).length > 0;
++}
++
++export function isProductiveStreamChunk(chunk, format) {
++  if (!chunk || chunk.done) return false;
++  const choice = chunk.choices?.[0];
++  const delta = choice?.delta || {};
++  if (hasText(delta.content) || hasText(delta.reasoning_content) || hasText(delta.refusal)) return true;
++  if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) return true;
++  if (choice?.message && (hasText(choice.message.content) || hasText(choice.message.reasoning_content) || hasText(choice.message.refusal))) return true;
++  if (format === FORMATS.CLAUDE || chunk.type?.startsWith?.("content_block")) {
++    if (hasText(chunk.delta?.text) || hasText(chunk.delta?.thinking) || hasText(chunk.delta?.partial_json)) return true;
++    if (chunk.type === "content_block_start" && (chunk.content_block?.type === "tool_use" || chunk.content_block?.type === "server_tool_use")) return true;
++    if (hasText(chunk.content_block?.text) || hasText(chunk.content_block?.thinking)) return true;
++  }
++  const parts = chunk.candidates?.[0]?.content?.parts || chunk.response?.candidates?.[0]?.content?.parts;
++  if (Array.isArray(parts) && parts.some(part => hasText(part.text) || hasNonEmptyObject(part.functionCall))) return true;
++  if (format === FORMATS.OPENAI_RESPONSES || chunk.type?.startsWith?.("response.")) {
++    if (hasText(chunk.delta) || hasText(chunk.text)) return true;
++    if (chunk.item?.type === "function_call" || chunk.type === "response.function_call_arguments.delta") return true;
++    if (chunk.type === "response.output_item.added" && chunk.item?.type === "function_call") return true;
++    if (chunk.type === "response.refusal.delta" && hasText(chunk.delta)) return true;
++  }
++  return false;
++}
++
++export function isTerminalStreamChunk(chunk) {
++  if (!chunk) return false;
++  if (chunk.done) return true;
++  if (chunk.choices?.[0]?.finish_reason) return true;
++  if (["message_stop", "response.completed", "response.failed", "response.incomplete"].includes(chunk.type)) return true;
++  if (chunk.response?.candidates?.[0]?.finishReason || chunk.candidates?.[0]?.finishReason) return true;
++  return false;
++}
++
++function replayBufferedBody(reader, bufferedChunks) {
++  return new ReadableStream({
++    start(controller) {
++      for (const chunk of bufferedChunks) controller.enqueue(chunk);
++    },
++    async pull(controller) {
++      const { done, value } = await reader.read();
++      if (done) { controller.close(); return; }
++      controller.enqueue(value);
++    },
++    cancel(reason) { reader.cancel(reason).catch(() => {}); }
++  });
++}
++
++async function readWithDeadline(reader, ms, reason) {
++  let timer;
++  try {
++    return await Promise.race([
++      reader.read(),
++      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(reason)), Math.max(1, ms)); })
++    ]);
++  } finally {
++    clearTimeout(timer);
++  }
++}
++
++export async function guardInitialStream(providerResponse, { targetFormat, log, provider, model, policy }) {
++  if (!providerResponse.body) return { response: providerResponse };
++  const cfg = policy || {};
++  const now = Date.now();
++  const firstByteDeadline = now + (cfg.firstByteTimeoutMs || 10000);
++  const firstProductiveDeadline = now + (cfg.firstProductiveTimeoutMs || 90000);
++  const totalDeadline = now + (cfg.totalBudgetMs || 360000);
++  const reader = providerResponse.body.getReader();
++  const decoder = new TextDecoder("utf-8", { fatal: false });
++  const bufferedChunks = [];
++  let buffer = "";
++  let sawByte = false;
++  try {
++    while (true) {
++      const deadline = Math.min(totalDeadline, sawByte ? firstProductiveDeadline : firstByteDeadline, firstProductiveDeadline);
++      const left = deadline - Date.now();
++      if (left <= 0) {
++        const reason = !sawByte ? "first byte timeout" : "first productive timeout";
++        throw new Error("Upstream " + reason);
++      }
++      const { done, value } = await readWithDeadline(reader, left, sawByte ? "Upstream first productive timeout" : "Upstream first byte timeout");
++      if (done) break;
++      if (value && (value.byteLength || value.length || 0) > 0) sawByte = true;
++      bufferedChunks.push(value);
++      buffer += decoder.decode(value, { stream: true });
++      const lines = buffer.split("\n");
++      buffer = lines.pop() || "";
++      for (const line of lines) {
++        const trimmed = line.trim();
++        if (!trimmed || trimmed.startsWith(":")) continue;
++        const parsed = parseSSELine(trimmed, targetFormat) || parseSSELine(trimmed, FORMATS.OPENAI);
++        if (!parsed) continue;
++        if (isProductiveStreamChunk(parsed, targetFormat)) {
++          const body = replayBufferedBody(reader, bufferedChunks);
++          return { response: new Response(body, { status: providerResponse.status, statusText: providerResponse.statusText, headers: providerResponse.headers }) };
++        }
++        if (isTerminalStreamChunk(parsed)) {
++          await reader.cancel().catch(() => {});
++          return { error: "Empty upstream stream before content", status: HTTP_STATUS.BAD_GATEWAY };
++        }
++      }
++    }
++  } catch (error) {
++    await reader.cancel().catch(() => {});
++    return { error: error.message || "Upstream stream preflight failed", status: HTTP_STATUS.BAD_GATEWAY };
++  }
++  await reader.cancel().catch(() => {});
++  const suffix = sawByte ? "before content" : "without bytes";
++  log?.warn?.("STREAM", (provider?.toUpperCase?.() || provider) + " | " + model + " | empty " + suffix);
++  return { error: "Empty upstream stream " + suffix, status: HTTP_STATUS.BAD_GATEWAY };
++}
++
+ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, model, connectionId, body, onStreamComplete, apiKey }) {
+   const isDroidCLI = userAgent?.toLowerCase().includes("droid") || userAgent?.toLowerCase().includes("codex-cli");
+-  // Responses-API providers (e.g. codex) emit Responses SSE → translate into client format
+   const isResponsesProvider = PROVIDERS[provider]?.format === FORMATS.OPENAI_RESPONSES;
+   const needsCodexTranslation = isResponsesProvider && targetFormat === FORMATS.OPENAI_RESPONSES && !isDroidCLI;
+-
+   if (needsCodexTranslation) {
+     const codexTarget = CODEX_SOURCE_TO_TARGET[sourceFormat] || FORMATS.OPENAI;
+     return createSSETransformStreamWithLogger(FORMATS.OPENAI_RESPONSES, codexTarget, provider, reqLogger, toolNameMap, model, connectionId, body, onStreamComplete, apiKey);
+   }
+-
+   if (needsTranslation(targetFormat, sourceFormat)) {
+     return createSSETransformStreamWithLogger(targetFormat, sourceFormat, provider, reqLogger, toolNameMap, model, connectionId, body, onStreamComplete, apiKey);
+   }
+-
+   return createPassthroughStreamWithLogger(provider, reqLogger, model, connectionId, body, onStreamComplete, apiKey);
+ }
+ 
+-/**
+- * Handle streaming response — pipe provider SSE through transform stream to client.
+- */
+-export function handleStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, userAgent, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, streamController, onStreamComplete }) {
+-  if (onRequestSuccess) onRequestSuccess();
+-
++export async function handleStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, userAgent, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, streamController, onStreamComplete, log, streamTimeoutPolicy, routeInfo }) {
++  const guarded = await guardInitialStream(providerResponse, { targetFormat, log, provider, model, policy: streamTimeoutPolicy });
++  if (guarded.error) {
++    streamController.handleError(new Error(guarded.error));
++    return createErrorResult(guarded.status, guarded.error);
++  }
++  providerResponse = guarded.response;
++  if (onRequestSuccess) await onRequestSuccess();
+   const transformStream = buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, model, connectionId, body, onStreamComplete, apiKey });
+-
+-  // Responses passthrough: synthesize response.failed + [DONE] if the stream aborts/stalls before a terminal event
+   const isResponsesPassthrough = sourceFormat === FORMATS.OPENAI_RESPONSES && targetFormat === FORMATS.OPENAI_RESPONSES;
+   const onAbortTerminal = isResponsesPassthrough ? buildAbortedResponsesTerminalBytes : null;
+-  const stallTimeoutMs = PROVIDERS[provider]?.stallTimeoutMs || STREAM_STALL_TIMEOUT_MS;
++  const stallTimeoutMs = streamTimeoutPolicy?.idleAfterProductiveMs || PROVIDERS[provider]?.stallTimeoutMs || 180000;
+   const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs);
+-
+   const streamDetailId = `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+   saveRequestDetail(buildRequestDetail({
+-    provider, model, connectionId,
++    provider, model, connectionId, routeInfo,
+     latency: { ttft: 0, total: Date.now() - requestStartTime },
+     tokens: { prompt_tokens: 0, completion_tokens: 0 },
+     request: extractRequestConfig(body, stream),
+@@ -67,19 +177,11 @@ export function handleStreamingResponse({ providerResponse, provider, model, sou
+   }, { id: streamDetailId })).catch(err => {
+     console.error("[RequestDetail] Failed to save streaming request:", err.message);
+   });
+-
+-  return {
+-    success: true,
+-    response: new Response(transformedBody, { headers: SSE_HEADERS })
+-  };
++  return { success: true, response: new Response(transformedBody, { headers: SSE_HEADERS }) };
+ }
+ 
+-/**
+- * Build onStreamComplete callback for streaming usage tracking.
+- */
+-export function buildOnStreamComplete({ provider, model, connectionId, apiKey, requestStartTime, body, stream, finalBody, translatedBody, clientRawRequest }) {
++export function buildOnStreamComplete({ provider, model, connectionId, apiKey, requestStartTime, body, stream, finalBody, translatedBody, clientRawRequest, routeInfo }) {
+   const streamDetailId = `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+-
+   const onStreamComplete = (contentObj, usage, ttftAt) => {
+     const latency = {
+       ttft: ttftAt ? ttftAt - requestStartTime : Date.now() - requestStartTime,
+@@ -87,9 +189,8 @@ export function buildOnStreamComplete({ provider, model, connectionId, apiKey, r
+     };
+     const safeContent = contentObj?.content || "[Empty streaming response]";
+     const safeThinking = contentObj?.thinking || null;
+-
+     saveRequestDetail(buildRequestDetail({
+-      provider, model, connectionId,
++      provider, model, connectionId, routeInfo,
+       latency,
+       tokens: usage || { prompt_tokens: 0, completion_tokens: 0 },
+       request: extractRequestConfig(body, stream),
+@@ -100,9 +201,7 @@ export function buildOnStreamComplete({ provider, model, connectionId, apiKey, r
+     }, { id: streamDetailId })).catch(err => {
+       console.error("[RequestDetail] Failed to update streaming content:", err.message);
+     });
+-
+-    saveUsageStats({ provider, model, tokens: usage, connectionId, apiKey, endpoint: clientRawRequest?.endpoint, label: "STREAM USAGE" });
++    saveUsageStats({ provider, model, tokens: usage, connectionId, apiKey, endpoint: clientRawRequest?.endpoint, label: "STREAM USAGE", routeInfo });
+   };
+-
+   return { onStreamComplete, streamDetailId };
+ }
+diff --git a/open-sse/services/accountFallback.js b/open-sse/services/accountFallback.js
+index 8d280da..dff71be 100644
+--- a/open-sse/services/accountFallback.js
++++ b/open-sse/services/accountFallback.js
+@@ -1,4 +1,26 @@
+-import { ERROR_RULES, BACKOFF_CONFIG, TRANSIENT_COOLDOWN_MS } from "../config/errorConfig.js";
++import { ERROR_RULES, BACKOFF_CONFIG, TRANSIENT_COOLDOWN_MS, BUSY_CONNECTION_COOLDOWN_MS } from "../config/errorConfig.js";
++
++const BUSY_CONCURRENCY_TEXT = [
++  "hệ thống đang bận",
++  "system busy",
++  "try again later",
++  "please wait",
++  "pool limit",
++  "maximum concurrent requests",
++  "too many in-flight",
++  "in-flight requests",
++];
++
++const PREFLIGHT_TIMEOUT_TEXT = [
++  "upstream first byte timeout",
++  "upstream first productive timeout",
++  "upstream headers timeout",
++];
++
++function normalizeErrorText(errorText) {
++  if (!errorText) return "";
++  return (typeof errorText === "string" ? errorText : JSON.stringify(errorText)).toLowerCase();
++}
+ 
+ /**
+  * Calculate exponential backoff cooldown for rate limits (429)
+@@ -21,9 +43,7 @@ export function getQuotaCooldown(backoffLevel = 0) {
+  * @returns {{ shouldFallback: boolean, cooldownMs: number, newBackoffLevel?: number }}
+  */
+ export function checkFallbackError(status, errorText, backoffLevel = 0) {
+-  const lowerError = errorText
+-    ? (typeof errorText === "string" ? errorText : JSON.stringify(errorText)).toLowerCase()
+-    : "";
++  const lowerError = normalizeErrorText(errorText);
+ 
+   for (const rule of ERROR_RULES) {
+     // Text-based rule: match substring in error message
+@@ -49,6 +69,28 @@ export function checkFallbackError(status, errorText, backoffLevel = 0) {
+   return { shouldFallback: true, cooldownMs: TRANSIENT_COOLDOWN_MS };
+ }
+ 
++export function isBusyConcurrencyError(errorText) {
++  const lowerError = normalizeErrorText(errorText);
++  return !!lowerError && BUSY_CONCURRENCY_TEXT.some(text => lowerError.includes(text));
++}
++
++export function isPreflightTimeoutError(status, errorText) {
++  const lowerError = normalizeErrorText(errorText);
++  return Number(status) === 502 && PREFLIGHT_TIMEOUT_TEXT.some(text => lowerError.includes(text));
++}
++
++export function shouldLockConnectionForError({ status, errorText, recentFailureCount = 0 } = {}) {
++  if (isBusyConcurrencyError(errorText)) return true;
++  if (isPreflightTimeoutError(status, errorText) && recentFailureCount >= 2) return true;
++  return false;
++}
++
++export function resolveConnectionCooldownMs({ status, errorText, cooldownMs = 0, recentFailureCount = 0 } = {}) {
++  if (isBusyConcurrencyError(errorText)) return BUSY_CONNECTION_COOLDOWN_MS;
++  if (isPreflightTimeoutError(status, errorText) && recentFailureCount >= 2) return Math.max(cooldownMs || 0, BUSY_CONNECTION_COOLDOWN_MS);
++  return cooldownMs || 0;
++}
++
+ /**
+  * Check if account is currently unavailable (cooldown not expired)
+  */
+diff --git a/open-sse/services/combo.js b/open-sse/services/combo.js
+index 9216ab2..f6cdd69 100644
+--- a/open-sse/services/combo.js
++++ b/open-sse/services/combo.js
+@@ -3,7 +3,8 @@
+  */
+ 
+ import { checkFallbackError, formatRetryAfter } from "./accountFallback.js";
+-import { unavailableResponse } from "../utils/error.js";
++import { parseResetAfterText, parseRetryAfterHeader, unavailableResponse } from "../utils/error.js";
++import { isImmediateFallbackStatus, isRetryableTransientStatus, resolveRoutePolicy } from "./routePolicy.js";
+ import { getCapabilitiesForModel } from "../providers/capabilities.js";
+ import { extractTextContent } from "../translator/formats/gemini.js";
+ 
+@@ -86,6 +87,8 @@ export function reorderByCapabilities(models, required) {
+  * @type {Map<string, { index: number, consecutiveUseCount: number }>}
+  */
+ const comboRotationState = new Map();
++const DEFAULT_COMBO_RETRY_ATTEMPTS = 0;
++const DEFAULT_COMBO_RETRY_DELAY_MS = 1000;
+ 
+ // Trailing run of items after the last assistant/model turn = the current user
+ // turn. It may span several messages (e.g. text + image split across blocks),
+@@ -146,6 +149,28 @@ function rotateModelsFromIndex(models, currentIndex) {
+   return rotatedModels;
+ }
+ 
++function normalizeRetryAttempts(value) {
++  const parsed = Number.parseInt(value, 10);
++  if (!Number.isFinite(parsed)) return DEFAULT_COMBO_RETRY_ATTEMPTS;
++  return Math.max(0, Math.min(parsed, 10));
++}
++
++function normalizeRetryDelayMs(value) {
++  const parsed = Number.parseFloat(value);
++  if (!Number.isFinite(parsed)) return DEFAULT_COMBO_RETRY_DELAY_MS;
++  return Math.max(0, Math.min(Math.round(parsed), 30000));
++}
++
++function isTransientComboStatus(status) {
++  return isRetryableTransientStatus(status);
++}
++
++function toIsoRetryAfter(value) {
++  if (!value) return null;
++  const ms = typeof value === "number" ? value : new Date(value).getTime();
++  return Number.isFinite(ms) && ms > Date.now() ? new Date(ms).toISOString() : null;
++}
++
+ /**
+  * Get rotated model list based on strategy
+  * @param {string[]} models - Array of model strings
+@@ -224,9 +249,17 @@ export function getComboModelsFromData(modelStr, combosData) {
+  * @param {string} [options.comboName] - Name of the combo (for round-robin tracking)
+  * @param {string} [options.comboStrategy] - Strategy: "fallback" or "round-robin"
+  * @param {number|string} [options.comboStickyLimit=1] - Requests per combo model before switching
++ * @param {number|string} [options.comboRetryAttempts=3] - Transient retries across fallback models
++ * @param {number|string} [options.comboRetryDelayMs=2000] - Delay between transient retries in ms
+  * @returns {Promise<Response>}
+  */
+-export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, autoSwitch = true }) {
++export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, comboRetryAttempts, comboRetryDelayMs, comboPreflightTimeoutMs, autoSwitch = true }) {
++  const startedAt = Date.now();
++  const summary = { tried: 0, skipped: 0, failed: 0 };
++  const logSummary = (tail) => {
++    const durationMs = Date.now() - startedAt;
++    log.info("COMBO", `summary | combo=${comboName || body?.model || "unknown"} | ${tail} | tried=${summary.tried} | skipped=${summary.skipped} | failed=${summary.failed} | duration=${durationMs}ms`);
++  };
+   // Apply rotation strategy if enabled
+   let rotatedModels = getRotatedModels(models, comboName, comboStrategy, comboStickyLimit);
+ 
+@@ -242,20 +275,57 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
+     }
+   }
+   
++  const policy = resolveRoutePolicy("combo", { retryAttempts: comboRetryAttempts, retryDelayMs: comboRetryDelayMs, streamPreflightTimeoutMs: comboPreflightTimeoutMs });
++  const retryAttempts = normalizeRetryAttempts(policy.retry.attempts);
++  const retryDelayMs = normalizeRetryDelayMs(policy.retry.delayMs);
++  const totalDeadline = Date.now() + policy.stream.totalBudgetMs;
++
+   let lastError = null;
+   let earliestRetryAfter = null;
+   let lastStatus = null;
+ 
+   for (let i = 0; i < rotatedModels.length; i++) {
++    if (Date.now() >= totalDeadline) {
++      lastError = lastError || "Combo total budget exhausted";
++      lastStatus = lastStatus || 503;
++      summary.skipped += rotatedModels.length - i;
++      break;
++    }
+     const modelStr = rotatedModels[i];
++    summary.tried++;
+     log.info("COMBO", `Trying model ${i + 1}/${rotatedModels.length}: ${modelStr}`);
+ 
+     try {
+-      const result = await handleSingleModel(body, modelStr);
++      let result;
++      let attempt = 0;
++
++      while (true) {
++        result = await handleSingleModel(body, modelStr, {
++          comboName,
++          requestedModel: comboName || body?.model || null,
++          attemptModel: modelStr,
++          attemptIndex: i + 1,
++          attemptTotal: rotatedModels.length,
++          routeMode: "combo",
++          streamTimeoutPolicy: policy.stream,
++          streamPreflightTimeoutMs: policy.stream.firstProductiveTimeoutMs,
++        });
++
++        if (result.ok || isImmediateFallbackStatus(result.status) || !isTransientComboStatus(result.status) || attempt >= retryAttempts) {
++          break;
++        }
++
++        attempt++;
++        const remainingMs = totalDeadline - Date.now();
++        if (remainingMs <= retryDelayMs + policy.stream.firstProductiveTimeoutMs) break;
++        log.info("COMBO", `Model ${modelStr} transient ${result.status}, retry ${attempt}/${retryAttempts} after ${retryDelayMs / 1000}s`);
++        if (retryDelayMs > 0) await new Promise(r => setTimeout(r, Math.min(retryDelayMs, Math.max(0, totalDeadline - Date.now()))));
++      }
+       
+       // Success (2xx) - return response
+       if (result.ok) {
+-        log.info("COMBO", `Model ${modelStr} succeeded`);
++        log.info("COMBO", `Model ${modelStr} accepted stream`);
++        logSummary(`success=${modelStr}`);
+         return result;
+       }
+ 
+@@ -270,9 +340,11 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
+         // Ignore JSON parse errors
+       }
+ 
++      const parsedRetryAfter = toIsoRetryAfter(retryAfter) || toIsoRetryAfter(parseRetryAfterHeader(result.headers)) || toIsoRetryAfter(parseResetAfterText(errorText));
++
+       // Track earliest retryAfter across all combo models
+-      if (retryAfter && (!earliestRetryAfter || new Date(retryAfter) < new Date(earliestRetryAfter))) {
+-        earliestRetryAfter = retryAfter;
++      if (parsedRetryAfter && (!earliestRetryAfter || new Date(parsedRetryAfter) < new Date(earliestRetryAfter))) {
++        earliestRetryAfter = parsedRetryAfter;
+       }
+ 
+       // Normalize error text to string (Worker-safe)
+@@ -284,25 +356,20 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
+       const { shouldFallback, cooldownMs } = checkFallbackError(result.status, errorText);
+ 
+       if (!shouldFallback) {
++        summary.failed++;
++        logSummary(`stopped=${modelStr} | last_status=${result.status}`);
+         log.warn("COMBO", `Model ${modelStr} failed (no fallback)`, { status: result.status });
+         return result;
+       }
+ 
+-      // For transient errors (503/502/504), wait for cooldown before falling through
+-      // so a briefly-overloaded provider gets a chance to recover rather than being
+-      // skipped immediately (fixes: combo falls through on transient 503)
+-      if (cooldownMs && cooldownMs > 0 && cooldownMs <= 5000 &&
+-          (result.status === 503 || result.status === 502 || result.status === 504)) {
+-        log.info("COMBO", `Model ${modelStr} transient ${result.status}, waiting ${cooldownMs}ms before next`);
+-        await new Promise(r => setTimeout(r, cooldownMs));
+-      }
+-
+       // Fallback to next model
++      summary.failed++;
+       lastError = errorText || String(result.status);
+       if (!lastStatus) lastStatus = result.status;
+       log.warn("COMBO", `Model ${modelStr} failed, trying next`, { status: result.status });
+     } catch (error) {
+       // Catch unexpected exceptions to ensure fallback continues
++      summary.failed++;
+       lastError = error.message || String(error);
+       if (!lastStatus) lastStatus = 500;
+       log.warn("COMBO", `Model ${modelStr} threw error, trying next`, { error: lastError });
+@@ -319,10 +386,12 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
+ 
+   if (earliestRetryAfter) {
+     const retryHuman = formatRetryAfter(earliestRetryAfter);
++    logSummary(`all_failed | last_status=${status}`);
+     log.warn("COMBO", `All models failed | ${msg} (${retryHuman})`);
+     return unavailableResponse(status, msg, earliestRetryAfter, retryHuman);
+   }
+ 
++  logSummary(`all_failed | last_status=${status}`);
+   log.warn("COMBO", `All models failed | ${msg}`);
+   return new Response(
+     JSON.stringify({ error: { message: msg } }),
+@@ -504,7 +573,16 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
+ 
+   // A single-model fusion has nothing to fuse — just answer directly.
+   if (panel.length === 1) {
+-    return handleSingleModel(body, panel[0]);
++    return handleSingleModel(body, panel[0], {
++      comboName,
++      requestedModel: comboName || body?.model || null,
++      attemptModel: panel[0],
++      attemptIndex: 1,
++      attemptTotal: 1,
++      routeMode: "fusion",
++      streamTimeoutPolicy: resolveRoutePolicy("fusion").stream,
++      fusionRole: "single",
++    });
+   }
+ 
+   const cfg = { ...FUSION_DEFAULTS, ...(tuning || {}) };
+@@ -524,7 +602,17 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
+   }
+ 
+   const t0 = Date.now();
+-  const calls = panel.map((m) => withTimeout(handleSingleModel(panelBody, m, true), cfg.panelHardTimeoutMs));
++  const calls = panel.map((m, i) => withTimeout(handleSingleModel(panelBody, m, {
++    isPanel: true,
++    comboName,
++    requestedModel: comboName || body?.model || null,
++    attemptModel: m,
++    attemptIndex: i + 1,
++    attemptTotal: panel.length,
++    routeMode: "fusion",
++    streamTimeoutPolicy: resolveRoutePolicy("fusion").stream,
++    fusionRole: "panel",
++  }), cfg.panelHardTimeoutMs));
+   const settled = await collectPanel(calls, { ...cfg, minPanel });
+   log.info("FUSION", `fan-out collected in ${Date.now() - t0}ms`);
+ 
+@@ -541,7 +629,7 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
+       const json = await res.clone().json();
+       const text = extractPanelText(json);
+       if (text) {
+-        answers.push({ model, text });
++        answers.push({ model, text, response: res });
+         log.info("FUSION", `Panel ${model} ok (${text.length} chars)`);
+       } else {
+         log.warn("FUSION", `Panel ${model} returned empty content`);
+@@ -560,12 +648,21 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
+     );
+   }
+   if (answers.length === 1) {
+-    log.info("FUSION", `Only ${answers[0].model} succeeded — answering directly (no fusion)`);
+-    return handleSingleModel(body, answers[0].model);
++    log.info("FUSION", `Only ${answers[0].model} succeeded - returning panel answer (no judge)`);
++    return answers[0].response;
+   }
+ 
+   // 4. Judge analyzes + writes one final answer (streams to client if requested).
+   const judgeBody = appendUserTurn(body, buildJudgePrompt(answers));
+   log.info("FUSION", `Judging ${answers.length} answers with ${judge}`);
+-  return handleSingleModel(judgeBody, judge);
++  return handleSingleModel(judgeBody, judge, {
++    comboName,
++    requestedModel: comboName || body?.model || null,
++    attemptModel: judge,
++    attemptIndex: 1,
++    attemptTotal: 1,
++    routeMode: "fusion",
++    streamTimeoutPolicy: resolveRoutePolicy("fusion").stream,
++    fusionRole: "judge",
++  });
+ }
+diff --git a/open-sse/services/routePolicy.js b/open-sse/services/routePolicy.js
+new file mode 100644
+index 0000000..9293801
+--- /dev/null
++++ b/open-sse/services/routePolicy.js
+@@ -0,0 +1,102 @@
++import {
++  DIRECT_STREAM_FIRST_BYTE_TIMEOUT_MS,
++  DIRECT_STREAM_FIRST_PRODUCTIVE_TIMEOUT_MS,
++  DIRECT_STREAM_IDLE_AFTER_PRODUCTIVE_MS,
++  DIRECT_STREAM_TOTAL_BUDGET_MS,
++  COMBO_STREAM_FIRST_BYTE_TIMEOUT_MS,
++  COMBO_STREAM_FIRST_PRODUCTIVE_TIMEOUT_MS,
++  COMBO_STREAM_IDLE_AFTER_PRODUCTIVE_MS,
++  COMBO_STREAM_TOTAL_BUDGET_MS,
++  FUSION_STREAM_FIRST_BYTE_TIMEOUT_MS,
++  FUSION_STREAM_FIRST_PRODUCTIVE_TIMEOUT_MS,
++  FUSION_STREAM_IDLE_AFTER_PRODUCTIVE_MS,
++  FUSION_STREAM_TOTAL_BUDGET_MS,
++  DEFAULT_RETRY_CONFIG,
++} from "../config/runtimeConfig.js";
++
++const MIN_MS = 1;
++const IMMEDIATE_FALLBACK_STATUSES = new Set([400, 401, 402, 403, 404, 406, 408, 429]);
++const TRANSIENT_RETRY_STATUSES = new Set([502, 503, 504]);
++
++const DEFAULTS = {
++  direct: {
++    stream: {
++      firstByteTimeoutMs: DIRECT_STREAM_FIRST_BYTE_TIMEOUT_MS,
++      firstProductiveTimeoutMs: DIRECT_STREAM_FIRST_PRODUCTIVE_TIMEOUT_MS,
++      idleAfterProductiveMs: DIRECT_STREAM_IDLE_AFTER_PRODUCTIVE_MS,
++      totalBudgetMs: DIRECT_STREAM_TOTAL_BUDGET_MS,
++    },
++    retry: {
++      502: DEFAULT_RETRY_CONFIG[502],
++      503: DEFAULT_RETRY_CONFIG[503],
++      504: DEFAULT_RETRY_CONFIG[504],
++    },
++  },
++  combo: {
++    stream: {
++      firstByteTimeoutMs: COMBO_STREAM_FIRST_BYTE_TIMEOUT_MS,
++      firstProductiveTimeoutMs: COMBO_STREAM_FIRST_PRODUCTIVE_TIMEOUT_MS,
++      idleAfterProductiveMs: COMBO_STREAM_IDLE_AFTER_PRODUCTIVE_MS,
++      totalBudgetMs: COMBO_STREAM_TOTAL_BUDGET_MS,
++    },
++    retry: { attempts: 0, delayMs: 1000 },
++  },
++  fusion: {
++    stream: {
++      firstByteTimeoutMs: FUSION_STREAM_FIRST_BYTE_TIMEOUT_MS,
++      firstProductiveTimeoutMs: FUSION_STREAM_FIRST_PRODUCTIVE_TIMEOUT_MS,
++      idleAfterProductiveMs: FUSION_STREAM_IDLE_AFTER_PRODUCTIVE_MS,
++      totalBudgetMs: FUSION_STREAM_TOTAL_BUDGET_MS,
++    },
++    retry: { attempts: 0, delayMs: 0 },
++  },
++};
++
++function toMs(value, fallback) {
++  const parsed = Number.parseInt(value, 10);
++  return Number.isFinite(parsed) && parsed >= 0 ? Math.max(MIN_MS, parsed) : fallback;
++}
++
++function clamp(value, min, max) {
++  return Math.min(Math.max(value, min), max);
++}
++
++export function isImmediateFallbackStatus(status) {
++  return IMMEDIATE_FALLBACK_STATUSES.has(Number(status));
++}
++
++export function isRetryableTransientStatus(status) {
++  return TRANSIENT_RETRY_STATUSES.has(Number(status));
++}
++
++export function adaptiveFirstProductiveTimeoutMs(routeMode, fallbackMs, stats = null) {
++  // Clamp even without stats so saved per-combo overrides cannot inflate the
++  // attempt deadline above what the route mode actually tolerates.
++  const bounds = routeMode === "combo"
++    ? { min: 4000, max: 12000 }
++    : routeMode === "fusion"
++      ? { min: 3000, max: 8000 }
++      : { min: 5000, max: fallbackMs };
++  if (!stats || !Number.isFinite(stats.p90TtftMs)) return clamp(fallbackMs, bounds.min, bounds.max);
++  return clamp(Math.round(stats.p90TtftMs * 1.8 + 1500), bounds.min, bounds.max);
++}
++
++export function resolveRoutePolicy(routeMode = "direct", overrides = {}) {
++  const key = DEFAULTS[routeMode] ? routeMode : "direct";
++  const base = DEFAULTS[key];
++  const streamOverrides = overrides.stream || {};
++  const legacyFirstProductive = overrides.streamPreflightTimeoutMs ?? overrides.preflightTimeoutMs;
++  const firstProductiveDefault = legacyFirstProductive ?? streamOverrides.firstProductiveTimeoutMs ?? base.stream.firstProductiveTimeoutMs;
++  const stream = {
++    firstByteTimeoutMs: toMs(streamOverrides.firstByteTimeoutMs, base.stream.firstByteTimeoutMs),
++    firstProductiveTimeoutMs: adaptiveFirstProductiveTimeoutMs(key, toMs(firstProductiveDefault, base.stream.firstProductiveTimeoutMs), overrides.ttftStats),
++    idleAfterProductiveMs: toMs(streamOverrides.idleAfterProductiveMs, base.stream.idleAfterProductiveMs),
++    totalBudgetMs: toMs(streamOverrides.totalBudgetMs, base.stream.totalBudgetMs),
++  };
++
++  const retry = { ...(base.retry || {}) };
++  if (overrides.retryAttempts != null) retry.attempts = Math.max(0, Math.min(Number.parseInt(overrides.retryAttempts, 10) || 0, 10));
++  if (overrides.retryDelayMs != null) retry.delayMs = Math.max(0, Math.min(Number.parseInt(overrides.retryDelayMs, 10) || 0, 30000));
++
++  return { routeMode: key, stream, retry };
++}
+diff --git a/open-sse/utils/error.js b/open-sse/utils/error.js
+index 315723e..3b45e49 100644
+--- a/open-sse/utils/error.js
++++ b/open-sse/utils/error.js
+@@ -49,6 +49,36 @@ export async function writeStreamError(writer, statusCode, message) {
+   await writer.write(encoder.encode(`data: ${JSON.stringify(errorBody)}\n\n`));
+ }
+ 
++
++function parseDurationText(text) {
++  if (!text || typeof text !== "string") return null;
++  const lower = text.toLowerCase();
++  const resetMatch = lower.match(/(?:reset|retry|try again|available)\s+(?:after|in)\s+([^.)\n]+)/i);
++  const src = resetMatch?.[1] || lower.match(/(\d+\s*h(?:ours?)?[^\n]*)|(\d+\s*m(?:in(?:ute)?s?)?[^\n]*)|(\d+\s*s(?:ec(?:ond)?s?)?)/i)?.[0];
++  if (!src) return null;
++  let ms = 0;
++  const hour = src.match(/(\d+)\s*h(?:ours?)?/i);
++  const min = src.match(/(\d+)\s*m(?:in(?:ute)?s?)?/i);
++  const sec = src.match(/(\d+)\s*s(?:ec(?:ond)?s?)?/i);
++  if (hour) ms += Number(hour[1]) * 3600000;
++  if (min) ms += Number(min[1]) * 60000;
++  if (sec) ms += Number(sec[1]) * 1000;
++  return ms > 0 ? Date.now() + ms : null;
++}
++
++export function parseRetryAfterHeader(headers) {
++  const raw = headers?.get?.("Retry-After") || headers?.get?.("retry-after");
++  if (!raw) return null;
++  const seconds = Number.parseFloat(raw);
++  if (Number.isFinite(seconds)) return Date.now() + Math.max(1, seconds) * 1000;
++  const dateMs = new Date(raw).getTime();
++  return Number.isFinite(dateMs) && dateMs > Date.now() ? dateMs : null;
++}
++
++export function parseResetAfterText(text) {
++  return parseDurationText(text);
++}
++
+ /**
+  * Parse upstream provider error response
+  * @param {Response} response - Fetch response from provider
+@@ -69,7 +99,7 @@ export async function parseUpstreamError(response, executor = null) {
+       const parsed = executor.parseError(response, bodyText);
+       if (parsed && typeof parsed === "object") {
+         const msg = parsed.message || DEFAULT_ERROR_MESSAGES[response.status] || `Upstream error: ${response.status}`;
+-        return { statusCode: parsed.status || response.status, message: msg, resetsAtMs: parsed.resetsAtMs };
++        return { statusCode: parsed.status || response.status, message: msg, resetsAtMs: parsed.resetsAtMs || parseRetryAfterHeader(response.headers) || parseResetAfterText(msg) };
+       }
+     } catch { /* fall through to default parsing */ }
+   }
+@@ -85,7 +115,7 @@ export async function parseUpstreamError(response, executor = null) {
+   const messageStr = typeof message === "string" ? message : JSON.stringify(message);
+   const finalMessage = messageStr || DEFAULT_ERROR_MESSAGES[response.status] || `Upstream error: ${response.status}`;
+ 
+-  return { statusCode: response.status, message: finalMessage };
++  return { statusCode: response.status, message: finalMessage, resetsAtMs: parseRetryAfterHeader(response.headers) || parseResetAfterText(finalMessage) };
+ }
+ 
+ /**
+diff --git a/public/favicon.svg b/public/favicon.svg
+index a72e45b..e9a9077 100644
+--- a/public/favicon.svg
++++ b/public/favicon.svg
+@@ -1,11 +1,4 @@
+ <svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+-  <rect width="32" height="32" rx="6" fill="url(#gradient)"/>
+-  <text x="16" y="24" font-family="system-ui, -apple-system, sans-serif" font-size="20" font-weight="700" fill="white" text-anchor="middle">9</text>
+-  <defs>
+-    <linearGradient id="gradient" x1="0" y1="0" x2="32" y2="32" gradientUnits="userSpaceOnUse">
+-      <stop stop-color="#f97815"/>
+-      <stop offset="1" stop-color="#c2590a"/>
+-    </linearGradient>
+-  </defs>
++  <rect width="32" height="32" rx="6" fill="#1f7a8c"/>
++  <text x="16" y="22" font-family="system-ui, -apple-system, sans-serif" font-size="15" font-weight="800" fill="white" text-anchor="middle">LLM</text>
+ </svg>
+-
+diff --git a/public/icons/icon-192.svg b/public/icons/icon-192.svg
+index e797891..b438028 100644
+--- a/public/icons/icon-192.svg
++++ b/public/icons/icon-192.svg
+@@ -1,4 +1,4 @@
+ <svg xmlns="http://www.w3.org/2000/svg" width="192" height="192" viewBox="0 0 192 192">
+-  <rect width="192" height="192" rx="24" fill="#0a0a0a"/>
+-  <text x="96" y="120" font-family="Arial, sans-serif" font-size="80" font-weight="bold" fill="#ffffff" text-anchor="middle">9R</text>
++  <rect width="192" height="192" rx="24" fill="#1f7a8c"/>
++  <text x="96" y="118" font-family="Arial, sans-serif" font-size="62" font-weight="bold" fill="#ffffff" text-anchor="middle">LLM</text>
+ </svg>
+diff --git a/public/icons/icon-512.svg b/public/icons/icon-512.svg
+index 6fef45a..384aa10 100644
+--- a/public/icons/icon-512.svg
++++ b/public/icons/icon-512.svg
+@@ -1,4 +1,4 @@
+ <svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+-  <rect width="512" height="512" rx="64" fill="#0a0a0a"/>
+-  <text x="256" y="320" font-family="Arial, sans-serif" font-size="200" font-weight="bold" fill="#ffffff" text-anchor="middle">9R</text>
++  <rect width="512" height="512" rx="64" fill="#1f7a8c"/>
++  <text x="256" y="314" font-family="Arial, sans-serif" font-size="164" font-weight="bold" fill="#ffffff" text-anchor="middle">LLM</text>
+ </svg>
+diff --git a/src/app/(dashboard)/dashboard/cli-tools/components/AntigravityToolCard.js b/src/app/(dashboard)/dashboard/cli-tools/components/AntigravityToolCard.js
+index 48962cc..d10489b 100644
+--- a/src/app/(dashboard)/dashboard/cli-tools/components/AntigravityToolCard.js
++++ b/src/app/(dashboard)/dashboard/cli-tools/components/AntigravityToolCard.js
+@@ -391,7 +391,7 @@ export default function AntigravityToolCard({
+           {!isRunning && serverIsWindows && (
+             <div className="flex items-center gap-2 px-2 py-1.5 rounded text-xs bg-yellow-500/10 text-yellow-600 border border-yellow-500/20">
+               <span className="material-symbols-outlined text-[14px]">warning</span>
+-              <span>Windows: Run terminal (9Router) as Administrator to enable MITM</span>
++              <span>Windows: Run terminal (RouterDone) as Administrator to enable MITM</span>
+             </div>
+           )}
+ 
+@@ -399,12 +399,12 @@ export default function AntigravityToolCard({
+           {!isRunning && (
+             <div className="flex flex-col gap-1.5 px-1">
+               <p className="text-xs text-text-muted">
+-                <span className="font-medium text-text-main">How it works:</span> Intercepts Antigravity traffic via DNS redirect, letting you reroute models through 9Router.
++                <span className="font-medium text-text-main">How it works:</span> Intercepts Antigravity traffic via DNS redirect, letting you reroute models through RouterDone.
+               </p>
+               <div className="flex flex-col gap-0.5 text-[11px] text-text-muted">
+                 <span>1. Generates SSL cert & adds to system keychain</span>
+                 <span>2. Redirects <code className="text-[10px] bg-surface px-1 rounded">daily-cloudcode-pa.googleapis.com</code> → localhost</span>
+-                <span>3. Maps Antigravity models to any provider via 9Router</span>
++                <span>3. Maps Antigravity models to any provider via RouterDone</span>
+               </div>
+             </div>
+           )}
+diff --git a/src/app/(dashboard)/dashboard/cli-tools/components/CodexToolCard.js b/src/app/(dashboard)/dashboard/cli-tools/components/CodexToolCard.js
+index 12ef389..0dea946 100644
+--- a/src/app/(dashboard)/dashboard/cli-tools/components/CodexToolCard.js
++++ b/src/app/(dashboard)/dashboard/cli-tools/components/CodexToolCard.js
+@@ -164,12 +164,12 @@ export default function CodexToolCard({ tool, isExpanded, onToggle, baseUrl, api
+ 
+     const effectiveSubagentModel = subagentModel || selectedModel;
+ 
+-    const configContent = `# 9Router Configuration for Codex CLI
++    const configContent = `# RouterDone Configuration for Codex CLI
+ model = "${selectedModel}"
+ model_provider = "9router"
+ 
+ [model_providers.9router]
+-name = "9Router"
++name = "RouterDone"
+ base_url = "${getEffectiveBaseUrl()}"
+ wire_api = "responses"
+ 
+diff --git a/src/app/(dashboard)/dashboard/cli-tools/components/MitmServerCard.js b/src/app/(dashboard)/dashboard/cli-tools/components/MitmServerCard.js
+index 8b2ab41..9099f21 100644
+--- a/src/app/(dashboard)/dashboard/cli-tools/components/MitmServerCard.js
++++ b/src/app/(dashboard)/dashboard/cli-tools/components/MitmServerCard.js
+@@ -165,17 +165,17 @@ export default function MitmServerCard({ apiKeys, cloudEnabled, onStatusChange }
+           {/* Purpose & How it works */}
+           <div className="px-2 py-2 rounded-lg bg-surface/50 border border-border/50 flex flex-col gap-2">
+             <p className="text-[11px] text-text-muted leading-relaxed">
+-              <span className="font-medium text-text-main">Purpose:</span> Use Antigravity IDE & GitHub Copilot → with ANY provider/model from 9Router
++              <span className="font-medium text-text-main">Purpose:</span> Use Antigravity IDE and GitHub Copilot with any provider/model from RouterDone
+             </p>
+             <p className="text-[11px] text-text-muted leading-relaxed">
+-              <span className="font-medium text-text-main">How it works:</span> Antigravity/Copilot IDE request → DNS redirect to localhost:443 → MITM proxy intercepts → 9Router → response to Antigravity/Copilot
++              <span className="font-medium text-text-main">How it works:</span> Antigravity/Copilot request goes through DNS redirect, localhost MITM proxy, RouterDone, then back to the IDE.
+             </p>
+           </div>
+ 
+           {/* Base URL + API Key — same row pattern as Claude Code / cli-tools */}
+           <div className="flex flex-col gap-2">
+             <div className="grid gap-1 sm:grid-cols-[8rem_auto_1fr] sm:items-center sm:gap-2">
+-              <span className="text-xs font-semibold text-text-main sm:text-right sm:text-sm">9Router Base URL</span>
++              <span className="text-xs font-semibold text-text-main sm:text-right sm:text-sm">Gateway Base URL</span>
+               <span className="material-symbols-outlined hidden text-text-muted text-[14px] sm:inline">arrow_forward</span>
+               <input
+                 type="text"
+@@ -258,7 +258,7 @@ export default function MitmServerCard({ apiKeys, cloudEnabled, onStatusChange }
+           {serverIsWindows && !isAdmin && (
+             <div className="flex items-center gap-2 px-2 py-1.5 rounded text-xs bg-red-500/10 text-red-600 border border-red-500/20">
+               <span className="material-symbols-outlined text-[14px]">shield_lock</span>
+-              <span>Administrator required — restart 9Router as Administrator to use MITM</span>
++              <span>Administrator required - restart RouterDone as Administrator to use MITM</span>
+             </div>
+           )}
+         </div>
+diff --git a/src/app/(dashboard)/dashboard/cli-tools/components/MitmToolCard.js b/src/app/(dashboard)/dashboard/cli-tools/components/MitmToolCard.js
+index 8238429..67f85b8 100644
+--- a/src/app/(dashboard)/dashboard/cli-tools/components/MitmToolCard.js
++++ b/src/app/(dashboard)/dashboard/cli-tools/components/MitmToolCard.js
+@@ -181,7 +181,7 @@ export default function MitmToolCard({
+             )}
+             {/* Info */}
+             <div className="flex flex-col gap-0.5 text-[11px] text-text-muted px-1">
+-              <p>Toggle DNS to redirect {tool.name} traffic through 9Router via MITM.</p>
++              <p>Toggle DNS to redirect {tool.name} traffic through RouterDone via MITM.</p>
+               {!dnsActive && (
+                 <p className="text-amber-600 text-[10px] mt-1">
+                   ⚠️ Enable DNS to edit model mappings
+diff --git a/src/app/(dashboard)/dashboard/combos/page.js b/src/app/(dashboard)/dashboard/combos/page.js
+index abfc215..a21de6b 100644
+--- a/src/app/(dashboard)/dashboard/combos/page.js
++++ b/src/app/(dashboard)/dashboard/combos/page.js
+@@ -11,6 +11,8 @@ import { isOpenAICompatibleProvider, isAnthropicCompatibleProvider } from "@/sha
+ 
+ // Validate combo name: only a-z, A-Z, 0-9, -, _
+ const VALID_NAME_REGEX = /^[a-zA-Z0-9_.\-]+$/;
++const DEFAULT_COMBO_RETRY_ATTEMPTS = 0;
++const DEFAULT_COMBO_RETRY_DELAY_MS = 1000;
+ 
+ export default function CombosPage() {
+   const [combos, setCombos] = useState([]);
+@@ -121,11 +123,16 @@ export default function CombosPage() {
+     try {
+       const updated = { ...comboStrategies };
+       const next = { ...(updated[comboName] || {}), ...patch };
+-      // Prune to keep settings clean: default fallback with no extras = no entry.
+-      if (!next.fallbackStrategy || next.fallbackStrategy === "fallback") {
++      const fallbackStrategy = next.fallbackStrategy || "fallback";
++      const retryAttempts = Number(next.retryAttempts ?? DEFAULT_COMBO_RETRY_ATTEMPTS);
++      const retryDelayMs = Number(next.retryDelayMs ?? DEFAULT_COMBO_RETRY_DELAY_MS);
++      const usesDefaultRetry = retryAttempts === DEFAULT_COMBO_RETRY_ATTEMPTS && retryDelayMs === DEFAULT_COMBO_RETRY_DELAY_MS;
++
++      // Prune to keep settings clean: default fallback with default retry = no entry.
++      if (fallbackStrategy === "fallback" && usesDefaultRetry && !next.judgeModel && !next.fusionTuning) {
+         delete updated[comboName];
+       } else {
+-        updated[comboName] = next;
++        updated[comboName] = { ...next, fallbackStrategy, retryAttempts, retryDelayMs };
+       }
+ 
+       await fetch("/api/settings", {
+@@ -245,6 +252,8 @@ function ComboCard({ combo, modelCaps = {}, activeProviders = [], copied, onCopy
+   const current = strategy.fallbackStrategy || "fallback";
+   const judge = strategy.judgeModel || "";
+   const isFusion = current === "fusion";
++  const retryAttempts = Number.isFinite(Number(strategy.retryAttempts)) ? Number(strategy.retryAttempts) : DEFAULT_COMBO_RETRY_ATTEMPTS;
++  const retryDelayMs = Number.isFinite(Number(strategy.retryDelayMs)) ? Number(strategy.retryDelayMs) : DEFAULT_COMBO_RETRY_DELAY_MS;
+ 
+   return (
+     <Card padding="sm" className="group">
+@@ -308,6 +317,37 @@ function ComboCard({ combo, modelCaps = {}, activeProviders = [], copied, onCopy
+             />
+           </div>
+ 
++          {!isFusion && (
++            <div className="grid grid-cols-2 gap-2 rounded-lg bg-black/[0.02] px-2 py-1.5 dark:bg-white/[0.02] sm:w-[180px]">
++              <label className="flex min-w-0 flex-col gap-0.5">
++                <span className="text-[10px] font-medium text-text-muted">Retry/model</span>
++                <input
++                  type="number"
++                  min="0"
++                  max="10"
++                  value={retryAttempts}
++                  onChange={(e) => onSetStrategy({ retryAttempts: Math.max(0, Math.min(Number(e.target.value || 0), 10)) })}
++                  className="h-7 w-full rounded border border-black/10 bg-white px-2 text-xs text-text-main outline-none focus:border-primary dark:border-white/10 dark:bg-black/20"
++                  title="Retries on the same combo model before trying the next model. 0 means immediate fallback."
++                />
++              </label>
++              <label className="flex min-w-0 flex-col gap-0.5">
++                <span className="text-[10px] font-medium text-text-muted">Delay (s)</span>
++                <input
++                  type="number"
++                  min="0"
++                  max="30"
++                  step="0.5"
++                  value={retryDelayMs / 1000}
++                  onChange={(e) => onSetStrategy({ retryDelayMs: Math.round(Math.max(0, Math.min(Number(e.target.value || 0), 30)) * 1000) })}
++                  disabled={retryAttempts === 0}
++                  className="h-7 w-full rounded border border-black/10 bg-white px-2 text-xs text-text-main outline-none focus:border-primary disabled:cursor-not-allowed disabled:opacity-45 dark:border-white/10 dark:bg-black/20"
++                  title="Delay between retries on the same model. Ignored when Retry/model is 0."
++                />
++              </label>
++            </div>
++          )}
++
+           <div className="grid grid-cols-3 gap-1 sm:flex">
+             <button
+               onClick={(e) => { e.stopPropagation(); onCopy(combo.name, `combo-${combo.id}`); }}
+diff --git a/src/app/(dashboard)/dashboard/endpoint/EndpointPageClient.js b/src/app/(dashboard)/dashboard/endpoint/EndpointPageClient.js
+index 88f5e81..b234cbd 100644
+--- a/src/app/(dashboard)/dashboard/endpoint/EndpointPageClient.js
++++ b/src/app/(dashboard)/dashboard/endpoint/EndpointPageClient.js
+@@ -1465,7 +1465,7 @@ export default function APIPageClient({ machineId }) {
+                   Cloudflare Tunnel
+                 </p>
+                 <p className="text-sm text-text-muted">
+-                  Expose your local 9Router to the internet. No port forwarding, no static IP needed. Share endpoint URL with your team or use it in Cursor, Cline, and other AI tools from anywhere.
++                  Expose your local RouterDone to the internet. No port forwarding, no static IP needed. Share endpoint URL with your team or use it in Cursor, Cline, and other AI tools from anywhere.
+                 </p>
+               </div>
+             </div>
+diff --git a/src/app/(dashboard)/dashboard/profile/page.js b/src/app/(dashboard)/dashboard/profile/page.js
+index 2851bc0..bba82b3 100644
+--- a/src/app/(dashboard)/dashboard/profile/page.js
++++ b/src/app/(dashboard)/dashboard/profile/page.js
+@@ -1127,7 +1127,7 @@ export default function ProfilePage() {
+ 
+         {/* App Info */}
+         <div className="text-center text-xs sm:text-sm text-text-muted py-4">
+-          <p>{APP_CONFIG.name} v{APP_CONFIG.version}</p>
++          <p>{APP_CONFIG.name} v{APP_CONFIG.gatewayVersion}</p>
+           <p className="mt-1">Local Mode - All data stored on your machine</p>
+         </div>
+       </div>
+diff --git a/src/app/(dashboard)/dashboard/usage/components/ProviderTopology.js b/src/app/(dashboard)/dashboard/usage/components/ProviderTopology.js
+index 3827a0f..008c86b 100644
+--- a/src/app/(dashboard)/dashboard/usage/components/ProviderTopology.js
++++ b/src/app/(dashboard)/dashboard/usage/components/ProviderTopology.js
+@@ -77,7 +77,7 @@ ProviderNode.propTypes = {
+   data: PropTypes.object.isRequired,
+ };
+ 
+-// Center 9Router node
++// Center gateway node
+ function RouterNode({ data }) {
+   return (
+     <div className="flex items-center justify-center px-5 py-3 rounded-xl border-2 border-primary bg-primary/5 shadow-md min-w-[130px]">
+@@ -86,8 +86,8 @@ function RouterNode({ data }) {
+       <Handle type="source" position={Position.Left} id="left" className="!bg-transparent !border-0 !w-0 !h-0" />
+       <Handle type="source" position={Position.Right} id="right" className="!bg-transparent !border-0 !w-0 !h-0" />
+ 
+-      <img src="/favicon.svg" alt="9Router" className="w-6 h-6 mr-2" />
+-      <span className="text-sm font-bold text-primary">9Router</span>
++      <img src="/favicon.svg" alt="RouterDone" className="w-6 h-6 mr-2" />
++      <span className="text-sm font-bold text-primary">RouterDone</span>
+       {data.activeCount > 0 && (
+         <span className="ml-2 px-1.5 py-0.5 rounded-full bg-primary text-white text-xs font-bold">
+           {data.activeCount}
+diff --git a/src/app/admin/page.js b/src/app/admin/page.js
+new file mode 100644
+index 0000000..8e8509f
+--- /dev/null
++++ b/src/app/admin/page.js
+@@ -0,0 +1,199 @@
++"use client";
++
++import { useState, useEffect } from "react";
++import { Card, Button, Input } from "@/shared/components";
++import { useRouter } from "next/navigation";
++
++export default function AdminLoginPage() {
++  const [password, setPassword] = useState("");
++  const [error, setError] = useState("");
++  const [resetHint, setResetHint] = useState("");
++  const [retryAfter, setRetryAfter] = useState(0);
++  const [loading, setLoading] = useState(false);
++  const [hasPassword, setHasPassword] = useState(null);
++  const [authMode, setAuthMode] = useState("password");
++  const [oidcConfigured, setOidcConfigured] = useState(false);
++  const [oidcLoginLabel, setOidcLoginLabel] = useState("Sign in with OIDC");
++  const router = useRouter();
++
++  useEffect(() => {
++    const loginError = new URLSearchParams(window.location.search).get("error");
++    if (loginError) setError(loginError);
++  }, []);
++
++  useEffect(() => {
++    if (retryAfter <= 0) return;
++    const id = setInterval(() => setRetryAfter((s) => (s > 0 ? s - 1 : 0)), 1000);
++    return () => clearInterval(id);
++  }, [retryAfter]);
++
++  useEffect(() => {
++    async function checkAuth() {
++      const controller = new AbortController();
++      const timeoutId = setTimeout(() => controller.abort(), 5000);
++      const baseUrl = typeof window !== "undefined" ? window.location.origin : "";
++
++      try {
++        const res = await fetch(`${baseUrl}/api/auth/status`, {
++          signal: controller.signal,
++        });
++        clearTimeout(timeoutId);
++
++        if (res.ok) {
++          const data = await res.json();
++          if (data.requireLogin === false) {
++            router.push("/dashboard");
++            router.refresh();
++            return;
++          }
++          setHasPassword(!!data.hasPassword);
++          setAuthMode(data.authMode || "password");
++          setOidcConfigured(data.oidcConfigured === true);
++          setOidcLoginLabel(data.oidcLoginLabel || "Sign in with OIDC");
++        } else {
++          setHasPassword(true);
++        }
++      } catch {
++        clearTimeout(timeoutId);
++        setHasPassword(true);
++      }
++    }
++
++    checkAuth();
++  }, [router]);
++
++  const handleLogin = async (e) => {
++    e.preventDefault();
++    setLoading(true);
++    setError("");
++    setResetHint("");
++
++    try {
++      const res = await fetch("/api/auth/login", {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ password }),
++      });
++
++      if (res.ok) {
++        router.push("/dashboard");
++        router.refresh();
++      } else {
++        const data = await res.json();
++        setError(data.error || "Invalid password");
++        if (data.resetHint) setResetHint(data.resetHint);
++        if (data.retryAfter) setRetryAfter(Number(data.retryAfter));
++      }
++    } catch {
++      setError("An error occurred. Please try again.");
++    } finally {
++      setLoading(false);
++    }
++  };
++
++  const handleOidcLogin = () => {
++    window.location.href = "/api/auth/oidc/start";
++  };
++
++  const oidcAvailable = oidcConfigured && ["oidc", "both"].includes(authMode);
++  const passwordAvailable = authMode !== "oidc" || !oidcConfigured;
++
++  if (hasPassword === null) {
++    return (
++      <div className="min-h-screen flex items-center justify-center bg-bg p-4">
++        <div className="text-center">
++          <div className="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
++          <p className="text-text-muted mt-4">Loading...</p>
++        </div>
++      </div>
++    );
++  }
++
++  return (
++    <div className="min-h-screen flex items-center justify-center bg-bg p-4 relative overflow-hidden">
++      <div className="landing-grid absolute inset-0 pointer-events-none" aria-hidden="true" />
++      <div className="relative z-10 w-full max-w-md">
++        <div className="text-center mb-8">
++          <h1 className="text-3xl font-bold text-primary mb-2">RouterDone</h1>
++          <p className="text-text-muted">
++            {authMode === "oidc" && oidcConfigured
++              ? "Sign in with your OIDC provider to access the admin dashboard"
++              : "Enter your password to access the admin dashboard"}
++          </p>
++        </div>
++
++        <Card>
++          <div className="flex flex-col gap-4">
++            {oidcAvailable && (
++              <Button type="button" variant="primary" className="w-full" onClick={handleOidcLogin}>
++                {oidcLoginLabel}
++              </Button>
++            )}
++
++            {oidcAvailable && passwordAvailable && <div className="h-px bg-border/60" />}
++
++            {passwordAvailable ? (
++              <form onSubmit={handleLogin} className="flex flex-col gap-4">
++                {((authMode === "oidc" && !oidcConfigured) || (authMode === "both" && !oidcConfigured)) && (
++                  <p className="text-xs text-amber-600 dark:text-amber-400 text-center">
++                    OIDC login is enabled, but the issuer/client fields are not configured yet. Password login is still available for recovery.
++                  </p>
++                )}
++
++                {authMode === "both" && oidcConfigured && (
++                  <p className="text-xs text-text-muted text-center">
++                    Password and OIDC login are both enabled.
++                  </p>
++                )}
++
++                <div className="flex flex-col gap-2">
++                  <label className="text-sm font-medium">Password</label>
++                  <Input
++                    type="password"
++                    placeholder="Enter password"
++                    value={password}
++                    onChange={(e) => setPassword(e.target.value)}
++                    required
++                    autoFocus={!oidcAvailable}
++                  />
++                  {error && <p className="text-xs text-red-500">{error}</p>}
++                  {retryAfter > 0 && (
++                    <p className="text-xs text-amber-600 dark:text-amber-400">
++                      Locked. Retry in <span className="font-mono">{retryAfter}s</span>.
++                    </p>
++                  )}
++                  {resetHint && (
++                    <p className="text-xs text-text-muted">
++                      Forgot password? Open <code className="bg-sidebar px-1 rounded">9router</code> CLI on the host - <b>Settings</b> - <b>Reset Password to Default</b>.
++                    </p>
++                  )}
++                </div>
++
++                <Button
++                  type="submit"
++                  variant="primary"
++                  className="w-full"
++                  loading={loading}
++                  disabled={retryAfter > 0}
++                >
++                  {retryAfter > 0 ? `Wait ${retryAfter}s` : "Login"}
++                </Button>
++
++                <p className="text-xs text-center text-text-muted mt-2">
++                  Default password is <code className="bg-sidebar px-1 rounded">123456</code>
++                </p>
++                {hasPassword === false && (
++                  <p className="text-xs text-center text-text-muted">
++                    No custom password is set yet. The default password above will work until you change it.
++                  </p>
++                )}
++              </form>
++            ) : (
++              error && <p className="text-xs text-red-500">{error}</p>
++            )}
++          </div>
++        </Card>
++      </div>
++    </div>
++  );
++}
+diff --git a/src/app/favicon.ico b/src/app/favicon.ico
+deleted file mode 100644
+index 718d6fea4835ec2d246af9800eddb7ffb276240c..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 25931
+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
+LrJugUA?W`A8`#=m
+
+diff --git a/src/app/layout.js b/src/app/layout.js
+index 5ea6c11..5ccc160 100644
+--- a/src/app/layout.js
++++ b/src/app/layout.js
+@@ -17,8 +17,8 @@ const inter = Inter({
+ });
+ 
+ export const metadata = {
+-  title: "9Router - AI Infrastructure Management",
+-  description: "One endpoint for all your AI providers. Manage keys, monitor usage, and scale effortlessly.",
++  title: "RouterDone",
++  description: "Admin console for RouterDone LLM API access.",
+   icons: {
+     icon: "/favicon.svg",
+   },
+diff --git a/src/app/login/page.js b/src/app/login/page.js
+index 38cf033..8c77a62 100644
+--- a/src/app/login/page.js
++++ b/src/app/login/page.js
+@@ -1,252 +1,19 @@
+-"use client";
++import { redirect } from "next/navigation";
+ 
+-import { useState, useEffect } from "react";
+-import { Card, Button, Input } from "@/shared/components";
+-import { useRouter } from "next/navigation";
++export default async function LoginRedirectPage({ searchParams }) {
++  const resolvedSearchParams = await searchParams;
++  const params = new URLSearchParams();
+ 
+-export default function LoginPage() {
+-  const [password, setPassword] = useState("");
+-  const [error, setError] = useState("");
+-  const [resetHint, setResetHint] = useState("");
+-  const [retryAfter, setRetryAfter] = useState(0);
+-  const [loading, setLoading] = useState(false);
+-  const [hasPassword, setHasPassword] = useState(null);
+-  const [authMode, setAuthMode] = useState("password");
+-  const [oidcConfigured, setOidcConfigured] = useState(false);
+-  const [oidcLoginLabel, setOidcLoginLabel] = useState("Sign in with OIDC");
+-  const [mustChange, setMustChange] = useState(false);
+-  const [newPassword, setNewPassword] = useState("");
+-  const router = useRouter();
+-
+-  // Countdown for rate-limit
+-  useEffect(() => {
+-    if (retryAfter <= 0) return;
+-    const id = setInterval(() => setRetryAfter((s) => (s > 0 ? s - 1 : 0)), 1000);
+-    return () => clearInterval(id);
+-  }, [retryAfter]);
+-
+-  useEffect(() => {
+-    async function checkAuth() {
+-      const controller = new AbortController();
+-      const timeoutId = setTimeout(() => controller.abort(), 5000);
+-      const baseUrl = typeof window !== "undefined" ? window.location.origin : "";
+-
+-      try {
+-        const res = await fetch(`${baseUrl}/api/auth/status`, {
+-          signal: controller.signal,
+-        });
+-        clearTimeout(timeoutId);
+-
+-        if (res.ok) {
+-          const data = await res.json();
+-          if (data.requireLogin === false) {
+-            router.push("/dashboard");
+-            router.refresh();
+-            return;
+-          }
+-          setHasPassword(!!data.hasPassword);
+-          setAuthMode(data.authMode || "password");
+-          setOidcConfigured(data.oidcConfigured === true);
+-          setOidcLoginLabel(data.oidcLoginLabel || "Sign in with OIDC");
+-        } else {
+-          // Safe fallback on non-OK response to avoid infinite loading state.
+-          setHasPassword(true);
+-        }
+-      } catch (err) {
+-        clearTimeout(timeoutId);
+-        setHasPassword(true);
+-      }
+-    }
+-    checkAuth();
+-  }, [router]);
+-
+-  const handleLogin = async (e) => {
+-    e.preventDefault();
+-    setLoading(true);
+-    setError("");
+-    setResetHint("");
+-
+-    try {
+-      const res = await fetch("/api/auth/login", {
+-        method: "POST",
+-        headers: { "Content-Type": "application/json" },
+-        body: JSON.stringify({ password }),
+-      });
+-
+-      if (res.ok) {
+-        const data = await res.json();
+-        if (data.mustChangePassword) {
+-          setMustChange(true);
+-          return;
+-        }
+-        router.push("/dashboard");
+-        router.refresh();
+-      } else {
+-        const data = await res.json();
+-        setError(data.error || "Invalid password");
+-        if (data.resetHint) setResetHint(data.resetHint);
+-        if (data.retryAfter) setRetryAfter(Number(data.retryAfter));
+-      }
+-    } catch (err) {
+-      setError("An error occurred. Please try again.");
+-    } finally {
+-      setLoading(false);
+-    }
+-  };
+-
+-  // Force a new password before entering the dashboard (default + remote).
+-  const handleSetNewPassword = async (e) => {
+-    e.preventDefault();
+-    setLoading(true);
+-    setError("");
+-    try {
+-      const res = await fetch("/api/settings", {
+-        method: "PATCH",
+-        headers: { "Content-Type": "application/json" },
+-        body: JSON.stringify({ currentPassword: password, newPassword }),
++  for (const [key, value] of Object.entries(resolvedSearchParams || {})) {
++    if (Array.isArray(value)) {
++      value.forEach((item) => {
++        if (item !== undefined) params.append(key, item);
+       });
+-      if (res.ok) {
+-        router.push("/dashboard");
+-        router.refresh();
+-      } else {
+-        const data = await res.json();
+-        setError(data.error || "Failed to set password");
+-      }
+-    } catch (err) {
+-      setError("An error occurred. Please try again.");
+-    } finally {
+-      setLoading(false);
++    } else if (value !== undefined) {
++      params.set(key, value);
+     }
+-  };
+-
+-  const handleOidcLogin = () => {
+-    window.location.href = "/api/auth/oidc/start";
+-  };
+-
+-  const oidcAvailable = oidcConfigured && ["oidc", "both"].includes(authMode);
+-  const passwordAvailable = authMode !== "oidc" || !oidcConfigured;
+-
+-  // Show loading state while checking password
+-  if (hasPassword === null) {
+-    return (
+-      <div className="min-h-screen flex items-center justify-center bg-bg p-4">
+-        <div className="text-center">
+-          <div className="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
+-          <p className="text-text-muted mt-4">Loading...</p>
+-        </div>
+-      </div>
+-    );
+   }
+ 
+-  return (
+-    <div className="min-h-screen flex items-center justify-center bg-bg p-4 relative overflow-hidden">
+-      {/* Faint grid background */}
+-      <div className="landing-grid absolute inset-0 pointer-events-none" aria-hidden="true" />
+-      <div className="relative z-10 w-full max-w-md">
+-        <div className="text-center mb-8">
+-          <h1 className="text-3xl font-bold text-primary mb-2">9Router</h1>
+-          <p className="text-text-muted">
+-            {authMode === "oidc" && oidcConfigured
+-              ? "Sign in with your OIDC provider to access the dashboard"
+-              : "Enter your password to access the dashboard"}
+-          </p>
+-        </div>
+-
+-        <Card>
+-          {mustChange ? (
+-            <form onSubmit={handleSetNewPassword} className="flex flex-col gap-4">
+-              <p className="text-sm text-amber-600 dark:text-amber-400 text-center">
+-                Set a new password before accessing the dashboard remotely.
+-              </p>
+-              <div className="flex flex-col gap-2">
+-                <label className="text-sm font-medium">New password</label>
+-                <Input
+-                  type="password"
+-                  placeholder="Enter new password"
+-                  value={newPassword}
+-                  onChange={(e) => setNewPassword(e.target.value)}
+-                  required
+-                  autoFocus
+-                />
+-                {error && <p className="text-xs text-red-500">{error}</p>}
+-              </div>
+-              <Button type="submit" variant="primary" className="w-full" loading={loading} disabled={!newPassword}>
+-                Set password
+-              </Button>
+-            </form>
+-          ) : (
+-          <div className="flex flex-col gap-4">
+-            {oidcAvailable && (
+-              <Button type="button" variant="primary" className="w-full" onClick={handleOidcLogin}>
+-                {oidcLoginLabel}
+-              </Button>
+-            )}
+-
+-            {oidcAvailable && passwordAvailable && <div className="h-px bg-border/60" />}
+-
+-            {passwordAvailable ? (
+-              <form onSubmit={handleLogin} className="flex flex-col gap-4">
+-                {((authMode === "oidc" && !oidcConfigured) || (authMode === "both" && !oidcConfigured)) && (
+-                  <p className="text-xs text-amber-600 dark:text-amber-400 text-center">
+-                    OIDC login is enabled, but the issuer/client fields are not configured yet. Password login is still available for recovery.
+-                  </p>
+-                )}
+-
+-                {authMode === "both" && oidcConfigured && (
+-                  <p className="text-xs text-text-muted text-center">
+-                    Password and OIDC login are both enabled.
+-                  </p>
+-                )}
+-
+-                <div className="flex flex-col gap-2">
+-                  <label className="text-sm font-medium">Password</label>
+-                  <Input
+-                    type="password"
+-                    placeholder="Enter password"
+-                    value={password}
+-                    onChange={(e) => setPassword(e.target.value)}
+-                    required
+-                    autoFocus={!oidcAvailable}
+-                  />
+-                  {error && <p className="text-xs text-red-500">{error}</p>}
+-                  {retryAfter > 0 && (
+-                    <p className="text-xs text-amber-600 dark:text-amber-400">
+-                      Locked. Retry in <span className="font-mono">{retryAfter}s</span>.
+-                    </p>
+-                  )}
+-                  {resetHint && (
+-                    <p className="text-xs text-text-muted">
+-                      Forgot password? Open <code className="bg-sidebar px-1 rounded">9router</code> CLI on the host → <b>Settings</b> → <b>Reset Password to Default</b>.
+-                    </p>
+-                  )}
+-                </div>
+-
+-                <Button
+-                  type="submit"
+-                  variant="primary"
+-                  className="w-full"
+-                  loading={loading}
+-                  disabled={retryAfter > 0}
+-                >
+-                  {retryAfter > 0 ? `Wait ${retryAfter}s` : "Login"}
+-                </Button>
+-
+-                <p className="text-xs text-center text-text-muted mt-2">
+-                  Default password is <code className="bg-sidebar px-1 rounded">123456</code>
+-                </p>
+-                {hasPassword === false && (
+-                  <p className="text-xs text-center text-amber-600 dark:text-amber-400">
+-                    Security risk: no password set. You will be asked to set one when logging in remotely.
+-                  </p>
+-                )}
+-              </form>
+-            ) : (
+-              error && <p className="text-xs text-red-500">{error}</p>
+-            )}
+-          </div>
+-          )}
+-        </Card>
+-      </div>
+-    </div>
+-  );
++  const query = params.toString();
++  redirect(query ? `/admin?${query}` : "/admin");
+ }
+diff --git a/src/app/manifest.js b/src/app/manifest.js
+index 6ad46da..e107cfb 100644
+--- a/src/app/manifest.js
++++ b/src/app/manifest.js
+@@ -1,9 +1,9 @@
+ export default function manifest() {
+   return {
+-    name: '9Router - AI Infrastructure Management',
+-    short_name: '9Router',
+-    description: 'One endpoint for all your AI providers. Manage keys, monitor usage, and scale effortlessly.',
+-    start_url: '/',
++    name: 'RouterDone',
++    short_name: 'LLM Gateway',
++    description: 'Admin console for RouterDone LLM API access.',
++    start_url: '/admin',
+     display: 'standalone',
+     background_color: '#0a0a0a',
+     theme_color: '#0a0a0a',
+diff --git a/src/app/page.js b/src/app/page.js
+index 9654779..5463b3f 100644
+--- a/src/app/page.js
++++ b/src/app/page.js
+@@ -1,5 +1,82 @@
+-import { redirect } from "next/navigation";
++import { APP_CONFIG } from "@/shared/constants/config";
+ 
+-export default function InitPage() {
+-  redirect('/dashboard');
++const endpoints = [
++  { path: "/v1/models", label: "List models" },
++  { path: "/v1/chat/completions", label: "Chat completions" },
++  { path: "/v1/messages", label: "Anthropic-compatible messages" },
++  { path: "/api/health", label: "Health check" },
++];
++
++const curlExample = `curl http://localhost:20128/v1/chat/completions \\
++  -H "Authorization: Bearer YOUR_API_KEY" \\
++  -H "Content-Type: application/json" \\
++  -d '{
++    "model": "openai/gpt-4o-mini",
++    "messages": [{"role": "user", "content": "Hello"}]
++  }'`;
++
++export default function PublicGatewayPage() {
++  return (
++    <main className="min-h-screen bg-bg text-text-main">
++      <section className="mx-auto flex min-h-screen w-full max-w-6xl flex-col px-5 py-8 sm:px-8 lg:px-10">
++        <header className="flex flex-wrap items-center justify-between gap-4 border-b border-border pb-5">
++          <div>
++            <p className="text-sm font-medium uppercase text-primary">
++              API Gateway
++            </p>
++            <h1 className="mt-2 text-3xl font-semibold text-text-main sm:text-4xl">
++              {APP_CONFIG.name}
++            </h1>
++          </div>
++          <div className="inline-flex items-center gap-2 rounded-md border border-border bg-surface px-3 py-2 text-sm font-medium text-text-main shadow-soft">
++            <span className="h-2.5 w-2.5 rounded-full bg-success" aria-hidden="true" />
++            Operational
++          </div>
++        </header>
++
++        <div className="grid flex-1 gap-8 py-10 lg:grid-cols-[minmax(0,1.05fr)_minmax(340px,0.95fr)] lg:items-center">
++          <div className="max-w-2xl">
++            <p className="text-lg leading-8 text-text-muted">
++              OpenAI-compatible endpoint for authorized RouterDone users.
++              Use the base URL below with your issued API key.
++            </p>
++
++            <div className="mt-8 rounded-lg border border-border bg-surface p-5 shadow-soft">
++              <p className="text-sm font-medium text-text-muted">Base URL</p>
++              <code className="mt-3 block break-all rounded-md bg-surface-2 px-4 py-3 text-base font-semibold text-primary">
++                http://localhost:20128/v1
++              </code>
++            </div>
++
++            <div className="mt-6 grid gap-3 sm:grid-cols-2">
++              {endpoints.map((endpoint) => (
++                <div key={endpoint.path} className="rounded-md border border-border bg-surface p-4">
++                  <p className="text-sm text-text-muted">{endpoint.label}</p>
++                  <code className="mt-2 block break-all text-sm font-semibold text-text-main">
++                    {endpoint.path}
++                  </code>
++                </div>
++              ))}
++            </div>
++          </div>
++
++          <div className="rounded-lg border border-border bg-[#101010] p-5 shadow-elevated dark:bg-surface">
++            <div className="mb-4 flex items-center justify-between gap-3">
++              <p className="text-sm font-semibold text-white">Quick test</p>
++              <span className="rounded-md bg-white/10 px-2.5 py-1 text-xs font-medium text-white/70">
++                v{APP_CONFIG.gatewayVersion}
++              </span>
++            </div>
++            <pre className="overflow-x-auto whitespace-pre-wrap break-words text-sm leading-6 text-gray-100">
++              <code>{curlExample}</code>
++            </pre>
++          </div>
++        </div>
++
++        <footer className="border-t border-border pt-5 text-sm text-text-muted">
++          For API access, use the key and model names provided by RouterDone.
++        </footer>
++      </section>
++    </main>
++  );
+ }
+diff --git a/src/dashboardGuard.js b/src/dashboardGuard.js
+index 6d86cc7..04bcda7 100644
+--- a/src/dashboardGuard.js
++++ b/src/dashboardGuard.js
+@@ -5,6 +5,7 @@ import { verifyDashboardAuthToken } from "@/lib/auth/dashboardSession";
+ 
+ const CLI_TOKEN_HEADER = "x-9r-cli-token";
+ const CLI_TOKEN_SALT = "9r-cli-auth";
++const ADMIN_LOGIN_PATH = "/admin";
+ 
+ let cachedCliToken = null;
+ async function getCliToken() {
+@@ -222,7 +223,7 @@ export async function proxy(request) {
+           const tunnelHost = settings.tunnelUrl ? new URL(settings.tunnelUrl).hostname.toLowerCase() : "";
+           const tailscaleHost = settings.tailscaleUrl ? new URL(settings.tailscaleUrl).hostname.toLowerCase() : "";
+           if ((tunnelHost && host === tunnelHost) || (tailscaleHost && host === tailscaleHost)) {
+-            return NextResponse.redirect(new URL("/login", request.url));
++            return NextResponse.redirect(new URL(ADMIN_LOGIN_PATH, request.url));
+           }
+         }
+       }
+@@ -239,16 +240,11 @@ export async function proxy(request) {
+       if (await verifyDashboardAuthToken(token)) {
+         return NextResponse.next();
+       } else {
+-        return NextResponse.redirect(new URL("/login", request.url));
++        return NextResponse.redirect(new URL(ADMIN_LOGIN_PATH, request.url));
+       }
+     }
+ 
+-    return NextResponse.redirect(new URL("/login", request.url));
+-  }
+-
+-  // Redirect / to /dashboard if logged in, or /dashboard if it's the root
+-  if (pathname === "/") {
+-    return NextResponse.redirect(new URL("/dashboard", request.url));
++    return NextResponse.redirect(new URL(ADMIN_LOGIN_PATH, request.url));
+   }
+ 
+   return NextResponse.next();
+diff --git a/src/lib/db/repos/usageRepo.js b/src/lib/db/repos/usageRepo.js
+index 8bd632a..5d9aaa8 100644
+--- a/src/lib/db/repos/usageRepo.js
++++ b/src/lib/db/repos/usageRepo.js
+@@ -260,7 +260,7 @@ export async function saveRequestUsage(entry) {
+           entry.timestamp, entry.provider || null, entry.model || null,
+           entry.connectionId || null, entry.apiKey || null, entry.endpoint || null,
+           promptTokens, completionTokens, entry.cost || 0, entry.status || "ok",
+-          stringifyJson(tokens), stringifyJson({}),
++          stringifyJson(tokens), stringifyJson(entry.meta || {}),
+         ]
+       );
+ 
+diff --git a/src/shared/components/Header.js b/src/shared/components/Header.js
+index f8427aa..3a8dfa0 100644
+--- a/src/shared/components/Header.js
++++ b/src/shared/components/Header.js
+@@ -108,7 +108,7 @@ const getPageInfo = (pathname) => {
+   if (pathname.includes("/mitm"))
+     return {
+       title: "MITM Proxy",
+-      description: "Intercept CLI tool traffic and route through 9Router",
++      description: "Intercept CLI tool traffic and route through RouterDone",
+       icon: "security",
+       breadcrumbs: [],
+     };
+@@ -129,7 +129,7 @@ const getPageInfo = (pathname) => {
+   if (pathname.includes("/skills"))
+     return {
+       title: "Agent Skills",
+-      description: "Copy a link and paste to your AI to use 9Router — no install needed",
++      description: "Copy a link and paste to your AI to use RouterDone - no install needed",
+       icon: "extension",
+       breadcrumbs: [],
+     };
+@@ -212,7 +212,7 @@ export default function Header({ onMenuClick, showMenuButton = true }) {
+     try {
+       const res = await fetch("/api/auth/logout", { method: "POST" });
+       if (res.ok) {
+-        router.push("/login");
++        router.push("/admin");
+         router.refresh();
+       }
+     } catch (err) {
+diff --git a/src/shared/components/Sidebar.js b/src/shared/components/Sidebar.js
+index 7d2c43a..883fdc0 100644
+--- a/src/shared/components/Sidebar.js
++++ b/src/shared/components/Sidebar.js
+@@ -43,6 +43,7 @@ export default function Sidebar({ onClose }) {
+   const [mediaOpen, setMediaOpen] = useState(false);
+   const [showRemoteModal, setShowRemoteModal] = useState(false);
+   const [isDisconnected, setIsDisconnected] = useState(false);
++  const [versionInfo, setVersionInfo] = useState(null);
+   const [updateInfo, setUpdateInfo] = useState(null);
+   const [showUpdateModal, setShowUpdateModal] = useState(false);
+   const [isUpdating, setIsUpdating] = useState(false);
+@@ -63,7 +64,10 @@ export default function Sidebar({ onClose }) {
+   useEffect(() => {
+     fetch("/api/version")
+       .then(res => res.json())
+-      .then(data => { if (data.hasUpdate) setUpdateInfo(data); })
++      .then(data => {
++        setVersionInfo(data);
++        setUpdateInfo(data.hasUpdate ? data : null);
++      })
+       .catch(() => {});
+   }, []);
+ 
+@@ -126,20 +130,26 @@ export default function Sidebar({ onClose }) {
+               <h1 className="text-lg font-semibold tracking-tight text-text-main">
+                 {APP_CONFIG.name}
+               </h1>
+-              <span className="text-xs text-text-muted">v{APP_CONFIG.version}</span>
++              <span className="text-xs text-text-muted">RouterDone v{APP_CONFIG.gatewayVersion}</span>
++              <span className="text-[11px] text-text-subtle">
++                9Router core v{versionInfo?.currentVersion || APP_CONFIG.version}
++                {versionInfo?.latestVersion && versionInfo.latestVersion !== versionInfo.currentVersion
++                  ? ` / latest v${versionInfo.latestVersion}`
++                  : ""}
++              </span>
+             </div>
+           </Link>
+           {updateInfo && (
+             <div className="flex flex-col gap-1.5 rounded p-1 -m-1">
+               <span className="text-xs font-semibold text-green-600 dark:text-amber-500">
+-                ↑ New version available: v{updateInfo.latestVersion}
++                ↑ 9Router core update: v{updateInfo.latestVersion}
+               </span>
+               <div className="flex items-center gap-2">
+                 <button
+                   onClick={() => setShowUpdateModal(true)}
+                   className="px-2 py-1 rounded bg-green-600 hover:bg-green-700 dark:bg-amber-500 dark:hover:bg-amber-600 text-white text-[11px] font-semibold transition-colors cursor-pointer"
+                 >
+-                  Update now
++                  Show command
+                 </button>
+                 <button
+                   onClick={() => copy(INSTALL_CMD)}
+@@ -338,8 +348,8 @@ export default function Sidebar({ onClose }) {
+         isOpen={showUpdateModal}
+         onClose={() => setShowUpdateModal(false)}
+         onConfirm={handleUpdate}
+-        title="Update 9Router"
+-        message={`Show install command for v${updateInfo?.latestVersion || ""}? You can copy it and shutdown to install manually.`}
++        title="Update 9Router Core"
++        message={`Show install command for 9Router core v${updateInfo?.latestVersion || ""}? You can copy it and shutdown to install manually.`}
+         confirmText="Show Command"
+         cancelText="Cancel"
+         variant="primary"
+@@ -389,7 +399,7 @@ function ManualUpdatePanel({ latestVersion, installCmd, copied, onCopyAndShutdow
+           <span className="material-symbols-outlined text-[24px]">content_copy</span>
+         </div>
+         <div>
+-          <h2 className="text-lg font-semibold">Update 9Router{latestVersion ? ` to v${latestVersion}` : ""}</h2>
++          <h2 className="text-lg font-semibold">Update 9Router Core{latestVersion ? ` to v${latestVersion}` : ""}</h2>
+           <p className="text-xs text-white/60">
+             {isDisconnected
+               ? "Server stopped. Paste the command into a terminal to install."
+diff --git a/src/shared/constants/config.js b/src/shared/constants/config.js
+index ebf5d12..4b44f51 100644
+--- a/src/shared/constants/config.js
++++ b/src/shared/constants/config.js
+@@ -2,9 +2,10 @@ import pkg from "../../../package.json" with { type: "json" };
+ 
+ // App configuration
+ export const APP_CONFIG = {
+-  name: "9Router Proxy",
+-  description: "AI Infrastructure Management",
++  name: "RouterDone",
++  description: "AI Gateway Management",
+   version: pkg.version,
++  gatewayVersion: "2.0.7",
+ };
+ 
+ // GitHub configuration
+diff --git a/src/sse/handlers/chat.js b/src/sse/handlers/chat.js
+index 571930e..7fa2ebf 100644
+--- a/src/sse/handlers/chat.js
++++ b/src/sse/handlers/chat.js
+@@ -16,6 +16,7 @@ import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
+ import { handleComboChat, handleFusionChat } from "open-sse/services/combo.js";
+ import { handleBypassRequest } from "open-sse/utils/bypassHandler.js";
+ import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
++import { resolveRoutePolicy } from "open-sse/services/routePolicy.js";
+ import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
+ import * as log from "../utils/logger.js";
+ import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
+@@ -97,19 +98,27 @@ export async function handleChat(request, clientRawRequest = null) {
+     const comboStrategies = settings.comboStrategies || {};
+     const comboSpecificStrategy = comboStrategies[modelStr]?.fallbackStrategy;
+     const comboStrategy = comboSpecificStrategy || settings.comboStrategy || "fallback";
++    const comboRetryAttempts = comboStrategies[modelStr]?.retryAttempts;
++    const comboRetryDelayMs = comboStrategies[modelStr]?.retryDelayMs;
++    const comboPolicy = resolveRoutePolicy(comboStrategy === "fusion" ? "fusion" : "combo", {
++      retryAttempts: comboStrategies[modelStr]?.retryAttempts,
++      retryDelayMs: comboStrategies[modelStr]?.retryDelayMs,
++      streamPreflightTimeoutMs: comboStrategies[modelStr]?.preflightTimeoutMs,
++    });
++    const comboPreflightTimeoutMs = comboPolicy.stream.firstProductiveTimeoutMs;
+ 
+     if (comboStrategy === "fusion") {
+       log.info("CHAT", `Combo "${modelStr}" with ${comboModels.length} models (strategy: fusion)`);
+       return handleFusionChat({
+         body,
+         models: comboModels,
+-        handleSingleModel: (b, m, isPanel) => {
++        handleSingleModel: (b, m, attemptContext = {}) => {
+           let cleanRawReq = clientRawRequest;
+-          if (isPanel && clientRawRequest) {
++          if (attemptContext.isPanel && clientRawRequest) {
+             const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
+             cleanRawReq = { ...clientRawRequest, body: cleanBody };
+           }
+-          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey);
++          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, attemptContext);
+         },
+         log,
+         comboName: modelStr,
+@@ -123,22 +132,25 @@ export async function handleChat(request, clientRawRequest = null) {
+     return handleComboChat({
+       body,
+       models: comboModels,
+-      handleSingleModel: (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
++      handleSingleModel: (b, m, attemptContext) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, attemptContext),
+       log,
+       comboName: modelStr,
+       comboStrategy,
+-      comboStickyLimit
++      comboStickyLimit,
++      comboRetryAttempts,
++      comboRetryDelayMs,
++      comboPreflightTimeoutMs
+     });
+   }
+ 
+   // Single model request
+-  return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey);
++  return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey, { requestedModel: modelStr, attemptModel: modelStr, attemptIndex: 1, attemptTotal: 1 });
+ }
+ 
+ /**
+  * Handle single model chat request
+  */
+-async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null) {
++async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, attemptContext = {}) {
+   const modelInfo = await getModelInfo(modelStr);
+ 
+   // If provider is null, this might be a combo name - check and handle
+@@ -150,19 +162,27 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+       const comboStrategies = chatSettings.comboStrategies || {};
+       const comboSpecificStrategy = comboStrategies[modelStr]?.fallbackStrategy;
+       const comboStrategy = comboSpecificStrategy || chatSettings.comboStrategy || "fallback";
++      const comboRetryAttempts = comboStrategies[modelStr]?.retryAttempts;
++      const comboRetryDelayMs = comboStrategies[modelStr]?.retryDelayMs;
++      const comboPolicy = resolveRoutePolicy(comboStrategy === "fusion" ? "fusion" : "combo", {
++        retryAttempts: comboStrategies[modelStr]?.retryAttempts,
++        retryDelayMs: comboStrategies[modelStr]?.retryDelayMs,
++        streamPreflightTimeoutMs: comboStrategies[modelStr]?.preflightTimeoutMs,
++      });
++      const comboPreflightTimeoutMs = comboPolicy.stream.firstProductiveTimeoutMs;
+ 
+       if (comboStrategy === "fusion") {
+         log.info("CHAT", `Combo "${modelStr}" with ${comboModels.length} models (strategy: fusion)`);
+         return handleFusionChat({
+           body,
+           models: comboModels,
+-          handleSingleModel: (b, m, isPanel) => {
++          handleSingleModel: (b, m, nestedAttemptContext = {}) => {
+             let cleanRawReq = clientRawRequest;
+-            if (isPanel && clientRawRequest) {
++            if (nestedAttemptContext.isPanel && clientRawRequest) {
+               const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
+               cleanRawReq = { ...clientRawRequest, body: cleanBody };
+             }
+-            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey);
++            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, nestedAttemptContext);
+           },
+           log,
+           comboName: modelStr,
+@@ -176,11 +196,14 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+       return handleComboChat({
+         body,
+         models: comboModels,
+-        handleSingleModel: (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
++        handleSingleModel: (b, m, nestedAttemptContext) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, nestedAttemptContext),
+         log,
+         comboName: modelStr,
+         comboStrategy,
+-        comboStickyLimit
++        comboStickyLimit,
++        comboRetryAttempts,
++        comboRetryDelayMs,
++        comboPreflightTimeoutMs
+       });
+     }
+     log.warn("CHAT", "Invalid model format", { model: modelStr });
+@@ -241,6 +264,17 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+     // Use shared chatCore
+     const chatSettings = await getSettings();
+     const providerThinking = (chatSettings.providerThinking || {})[provider] || null;
++    const routeInfo = {
++      requestedModel: attemptContext.requestedModel || body.model || modelStr,
++      comboName: attemptContext.comboName || null,
++      attemptModel: attemptContext.attemptModel || modelStr,
++      attemptIndex: attemptContext.attemptIndex || 1,
++      attemptTotal: attemptContext.attemptTotal || 1,
++      routeMode: attemptContext.routeMode || (attemptContext.comboName ? "combo" : "direct"),
++      fusionRole: attemptContext.fusionRole || null,
++      actualProvider: provider,
++      actualModel: model,
++    };
+     const result = await handleChatCore({
+       body: { ...body, model: `${provider}/${model}` },
+       modelInfo: { provider, model },
+@@ -260,6 +294,8 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+       ponytailEnabled: !!chatSettings.ponytailEnabled,
+       ponytailLevel: chatSettings.ponytailLevel || "full",
+       providerThinking,
++      routeInfo,
++      streamTimeoutPolicy: resolveRoutePolicy(attemptContext.routeMode || (attemptContext.comboName ? "combo" : "direct"), { stream: attemptContext.streamTimeoutPolicy, streamPreflightTimeoutMs: attemptContext.streamPreflightTimeoutMs }).stream,
+       // Detect source format by endpoint + body
+       sourceFormatOverride: request?.url ? detectFormatByEndpoint(new URL(request.url).pathname, body) : null,
+       onCredentialsRefreshed: async (newCreds) => {
+diff --git a/src/sse/services/auth.js b/src/sse/services/auth.js
+index 241082d..5e8208f 100644
+--- a/src/sse/services/auth.js
++++ b/src/sse/services/auth.js
+@@ -1,6 +1,6 @@
+ import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings } from "@/lib/localDb";
+ import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
+-import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
++import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil, isBusyConcurrencyError, isPreflightTimeoutError, shouldLockConnectionForError, resolveConnectionCooldownMs } from "open-sse/services/accountFallback.js";
+ import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
+ import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
+ import * as log from "../utils/logger.js";
+@@ -205,23 +205,50 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
+   const connections = await getProviderConnections({ provider });
+   const conn = connections.find(c => c.id === connectionId);
+   const backoffLevel = conn?.backoffLevel || 0;
++  const now = Date.now();
++  const reasonText = typeof errorText === "string" ? errorText : (errorText ? JSON.stringify(errorText) : "Provider error");
++  const busyOrConcurrency = isBusyConcurrencyError(reasonText);
++  const preflightTimeout = isPreflightTimeoutError(status, reasonText);
++  const lastFailureAtMs = conn?.comboPreflightFailureAt ? new Date(conn.comboPreflightFailureAt).getTime() : 0;
++  const recentSameKind = lastFailureAtMs && (now - lastFailureAtMs <= 60 * 1000) && conn?.comboPreflightFailureKind === (busyOrConcurrency ? "busy" : preflightTimeout ? "preflight" : null);
++  const recentFailureCount = (busyOrConcurrency || preflightTimeout) ? (recentSameKind ? (conn?.comboPreflightFailureCount || 0) + 1 : 1) : 0;
+ 
+   // Provider-specific precise cooldown (e.g. codex usage_limit_reached resets_at) overrides backoff
+   let shouldFallback, cooldownMs, newBackoffLevel;
+-  if (resetsAtMs && resetsAtMs > Date.now()) {
++  if (busyOrConcurrency) {
++    shouldFallback = true;
++    cooldownMs = resolveConnectionCooldownMs({ status, errorText: reasonText });
++    newBackoffLevel = 0;
++  } else if (resetsAtMs && resetsAtMs > Date.now()) {
+     shouldFallback = true;
+     cooldownMs = Math.min(resetsAtMs - Date.now(), MAX_RATE_LIMIT_COOLDOWN_MS);
+     newBackoffLevel = 0;
+   } else {
+-    ({ shouldFallback, cooldownMs, newBackoffLevel } = checkFallbackError(status, errorText, backoffLevel));
++    ({ shouldFallback, cooldownMs, newBackoffLevel } = checkFallbackError(status, reasonText, backoffLevel));
+   }
+   if (!shouldFallback) return { shouldFallback: false, cooldownMs: 0 };
+ 
+-  const reason = typeof errorText === "string" ? errorText.slice(0, 100) : "Provider error";
+-  const lockUpdate = buildModelLockUpdate(model, cooldownMs);
++  const lockConnection = shouldLockConnectionForError({ status, errorText: reasonText, recentFailureCount });
++  if (lockConnection) {
++    cooldownMs = resolveConnectionCooldownMs({ status, errorText: reasonText, cooldownMs, recentFailureCount });
++  }
++  const reason = reasonText.slice(0, 100);
++  const lockUpdate = buildModelLockUpdate(lockConnection ? null : model, cooldownMs);
++  const failureUpdate = (busyOrConcurrency || preflightTimeout)
++    ? {
++        comboPreflightFailureKind: busyOrConcurrency ? "busy" : "preflight",
++        comboPreflightFailureCount: recentFailureCount,
++        comboPreflightFailureAt: new Date(now).toISOString(),
++      }
++    : {
++        comboPreflightFailureKind: null,
++        comboPreflightFailureCount: 0,
++        comboPreflightFailureAt: null,
++      };
+ 
+   await updateProviderConnection(connectionId, {
+     ...lockUpdate,
++    ...failureUpdate,
+     testStatus: "unavailable",
+     lastError: reason,
+     errorCode: status,
+@@ -278,7 +305,15 @@ export async function clearAccountError(connectionId, currentConnection, model =
+ 
+   // Only reset error state if no active locks remain
+   if (remainingActiveLocks.length === 0) {
+-    Object.assign(clearObj, { testStatus: "active", lastError: null, lastErrorAt: null, backoffLevel: 0 });
++    Object.assign(clearObj, {
++      testStatus: "active",
++      lastError: null,
++      lastErrorAt: null,
++      backoffLevel: 0,
++      comboPreflightFailureKind: null,
++      comboPreflightFailureCount: 0,
++      comboPreflightFailureAt: null,
++    });
+   }
+ 
+   await updateProviderConnection(connectionId, clearObj);
+diff --git a/tests/unit/combo-fallback-watchdog.test.js b/tests/unit/combo-fallback-watchdog.test.js
+new file mode 100644
+index 0000000..27dcacc
+--- /dev/null
++++ b/tests/unit/combo-fallback-watchdog.test.js
+@@ -0,0 +1,165 @@
++import { describe, it, expect, beforeEach } from "vitest";
++
++import { handleComboChat, getRotatedModels, resetComboRotation } from "../../open-sse/services/combo.js";
++import { parseResetAfterText, parseRetryAfterHeader } from "../../open-sse/utils/error.js";
++import { guardInitialStream, isProductiveStreamChunk } from "../../open-sse/handlers/chatCore/streamingHandler.js";
++import { resolveRoutePolicy } from "../../open-sse/services/routePolicy.js";
++import { isBusyConcurrencyError, shouldLockConnectionForError, resolveConnectionCooldownMs } from "../../open-sse/services/accountFallback.js";
++
++describe("adaptive combo fallback", () => {
++  beforeEach(() => resetComboRotation());
++
++  const log = { info: () => {}, warn: () => {}, debug: () => {} };
++
++  it("falls back immediately on combo 429 without retrying the same model", async () => {
++    const tried = [];
++    const res = await handleComboChat({
++      body: { model: "combo", messages: [] },
++      models: ["p/a", "p/b"],
++      comboName: "combo",
++      comboRetryAttempts: 3,
++      comboRetryDelayMs: 0,
++      log,
++      handleSingleModel: async (_body, model) => {
++        tried.push(model);
++        if (model === "p/a") return new Response(JSON.stringify({ error: { message: "rate limited" } }), { status: 429 });
++        return new Response(JSON.stringify({ ok: true }), { status: 200 });
++      },
++    });
++    expect(res.ok).toBe(true);
++    expect(tried).toEqual(["p/a", "p/b"]);
++  });
++
++  it("retries transient 503 according to config, then falls back", async () => {
++    const tried = [];
++    const res = await handleComboChat({
++      body: { model: "combo", messages: [] },
++      models: ["p/a", "p/b"],
++      comboName: "combo",
++      comboRetryAttempts: 1,
++      comboRetryDelayMs: 0,
++      log,
++      handleSingleModel: async (_body, model) => {
++        tried.push(model);
++        if (model === "p/a") return new Response(JSON.stringify({ error: { message: "overloaded" } }), { status: 503 });
++        return new Response(JSON.stringify({ ok: true }), { status: 200 });
++      },
++    });
++    expect(res.ok).toBe(true);
++    expect(tried).toEqual(["p/a", "p/a", "p/b"]);
++  });
++
++  it("round-robin only chooses start; failed starter still falls through remaining models", async () => {
++    expect(getRotatedModels(["p/a", "p/b", "p/c"], "rr", "round-robin")[0]).toBe("p/a");
++    const tried = [];
++    const res = await handleComboChat({
++      body: { model: "rr", messages: [] },
++      models: ["p/a", "p/b", "p/c"],
++      comboName: "rr",
++      comboStrategy: "round-robin",
++      comboRetryAttempts: 0,
++      log,
++      handleSingleModel: async (_body, model) => {
++        tried.push(model);
++        if (model !== "p/c") return new Response(JSON.stringify({ error: { message: "bad gateway" } }), { status: 502 });
++        return new Response(JSON.stringify({ ok: true }), { status: 200 });
++      },
++    });
++    expect(res.ok).toBe(true);
++    expect(tried).toEqual(["p/b", "p/c"]);
++  });
++
++  it("emits combo summary counters", async () => {
++    const infos = [];
++    const summaryLog = { info: (_tag, msg) => infos.push(msg), warn: () => {}, debug: () => {} };
++    const res = await handleComboChat({
++      body: { model: "combo", messages: [] },
++      models: ["p/a", "p/b"],
++      comboName: "combo",
++      comboRetryAttempts: 0,
++      log: summaryLog,
++      handleSingleModel: async (_body, model) => {
++        if (model === "p/a") return new Response(JSON.stringify({ error: { message: "bad gateway" } }), { status: 502 });
++        return new Response(JSON.stringify({ ok: true }), { status: 200 });
++      },
++    });
++    expect(res.ok).toBe(true);
++    expect(infos.some(msg => msg.includes("summary | combo=combo | success=p/b | tried=2") && msg.includes("failed=1"))).toBe(true);
++  });
++});
++
++describe("productive stream watchdog", () => {
++  const log = { warn: () => {} };
++
++  function sseResponse(lines, keepOpen = false) {
++    return new Response(new ReadableStream({
++      start(controller) {
++        for (const line of lines) controller.enqueue(new TextEncoder().encode(line));
++        if (!keepOpen) controller.close();
++      }
++    }), { headers: { "Content-Type": "text/event-stream" } });
++  }
++
++  it("rejects DONE without content before client response starts", async () => {
++    const res = await guardInitialStream(sseResponse(["data: [DONE]\n\n"]), {
++      targetFormat: null, log, provider: "p", model: "m",
++      policy: { firstByteTimeoutMs: 5, firstProductiveTimeoutMs: 20, totalBudgetMs: 50 },
++    });
++    expect(res.error).toMatch(/Empty upstream stream/);
++  });
++
++  it("does not treat metadata-only chunks as productive", async () => {
++    const res = await guardInitialStream(sseResponse(["data: {\"id\":\"x\",\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n"], true), {
++      targetFormat: null, log, provider: "p", model: "m",
++      policy: { firstByteTimeoutMs: 5, firstProductiveTimeoutMs: 20, totalBudgetMs: 60 },
++    });
++    expect(res.error).toMatch(/productive timeout/);
++  });
++
++  it("counts content, thinking, and tool calls as productive", () => {
++    expect(isProductiveStreamChunk({ choices: [{ delta: { content: "hi" } }] })).toBe(true);
++    expect(isProductiveStreamChunk({ choices: [{ delta: { reasoning_content: "thinking" } }] })).toBe(true);
++    expect(isProductiveStreamChunk({ choices: [{ delta: { tool_calls: [{ index: 0 }] } }] })).toBe(true);
++    expect(isProductiveStreamChunk({ choices: [{ delta: { role: "assistant" } }] })).toBe(false);
++    expect(isProductiveStreamChunk({ usage: { prompt_tokens: 1, completion_tokens: 0 } })).toBe(false);
++  });
++
++  it("direct default timeout is longer than combo default timeout", () => {
++    expect(resolveRoutePolicy("direct").stream.firstProductiveTimeoutMs).toBeGreaterThan(resolveRoutePolicy("combo").stream.firstProductiveTimeoutMs);
++  });
++});
++
++describe("retry-after parsing", () => {
++  it("parses Retry-After header and reset-after text", () => {
++    const h = new Headers({ "Retry-After": "7" });
++    expect(parseRetryAfterHeader(h)).toBeGreaterThan(Date.now() + 6000);
++    const reset = parseResetAfterText("quota exceeded, reset after 2m 7s");
++    expect(reset).toBeGreaterThan(Date.now() + 120000);
++    expect(reset).toBeLessThan(Date.now() + 130000);
++  });
++});
++
++describe("busy and connection cooldown classification", () => {
++  it("classifies provider busy/concurrency text for short account cooldown", () => {
++    for (const msg of [
++      "Hệ thống đang bận, vui lòng thử lại",
++      "system busy",
++      "try again later",
++      "please wait",
++      "POOL LIMIT",
++      "maximum concurrent requests",
++      "too many in-flight requests",
++    ]) {
++      expect(isBusyConcurrencyError(msg)).toBe(true);
++      expect(shouldLockConnectionForError({ status: 429, errorText: msg, recentFailureCount: 1 })).toBe(true);
++      expect(resolveConnectionCooldownMs({ status: 429, errorText: msg, cooldownMs: 1000 })).toBeGreaterThanOrEqual(5000);
++    }
++  });
++
++  it("locks a connection after two recent preflight timeouts", () => {
++    const msg = "Upstream first productive timeout";
++    expect(shouldLockConnectionForError({ status: 502, errorText: msg, recentFailureCount: 1 })).toBe(false);
++    expect(shouldLockConnectionForError({ status: 502, errorText: msg, recentFailureCount: 2 })).toBe(true);
++    expect(resolveConnectionCooldownMs({ status: 502, errorText: msg, cooldownMs: 1000, recentFailureCount: 2 })).toBeGreaterThan(1000);
++  });
++});

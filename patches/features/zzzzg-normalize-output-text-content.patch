@@ -1,0 +1,69 @@
+diff --git a/open-sse/utils/stream.js b/open-sse/utils/stream.js
+--- a/open-sse/utils/stream.js
++++ b/open-sse/utils/stream.js
+@@ -13,6 +13,39 @@
+ 
+ // sharedEncoder is stateless — safe to share across streams
+ const sharedEncoder = new TextEncoder();
++
++function textFromContentPart(part) {
++  if (typeof part === "string") return part;
++  if (!part || typeof part !== "object") return "";
++  if (typeof part.text === "string") return part.text;
++  if (typeof part.output_text === "string") return part.output_text;
++  if (Array.isArray(part.content)) return part.content.map(textFromContentPart).filter(Boolean).join("");
++  return "";
++}
++
++function normalizeAssistantContent(value) {
++  if (Array.isArray(value)) return value.map(textFromContentPart).filter(Boolean).join("");
++  if (value && typeof value === "object") return textFromContentPart(value);
++  return value;
++}
++
++function normalizeOpenAIChunkTextFields(parsed) {
++  let changed = false;
++  if (!Array.isArray(parsed?.choices)) return changed;
++  for (const choice of parsed.choices) {
++    const delta = choice?.delta;
++    if (delta && Array.isArray(delta.content)) {
++      delta.content = normalizeAssistantContent(delta.content);
++      changed = true;
++    }
++    const message = choice?.message;
++    if (message && Array.isArray(message.content)) {
++      message.content = normalizeAssistantContent(message.content);
++      changed = true;
++    }
++  }
++  return changed;
++}
+ 
+ /**
+  * Stream modes
+@@ -115,6 +148,10 @@
+                 if (!parsed.created) { parsed.created = Math.floor(Date.now() / 1000); fieldsInjected = true; }
+               }
+ 
++              if (normalizeOpenAIChunkTextFields(parsed)) {
++                fieldsInjected = true;
++              }
++
+               // Strip Azure-specific non-standard fields from streaming chunks
+               if (parsed.prompt_filter_results !== undefined) {
+                 delete parsed.prompt_filter_results;
+diff --git a/src/app/(dashboard)/dashboard/basic-chat/BasicChatPageClient.js b/src/app/(dashboard)/dashboard/basic-chat/BasicChatPageClient.js
+--- a/src/app/(dashboard)/dashboard/basic-chat/BasicChatPageClient.js
++++ b/src/app/(dashboard)/dashboard/basic-chat/BasicChatPageClient.js
+@@ -30,8 +30,11 @@
+   if (value == null) return "";
+   if (Array.isArray(value)) return value.map(textValue).filter(Boolean).join(" ");
+   if (typeof value === "object") {
++    if (typeof value.text === "string") return value.text;
++    if (typeof value.output_text === "string") return value.output_text;
+     if (typeof value.message === "string") return value.message;
+     if (typeof value.error === "string") return value.error;
++    if (Array.isArray(value.content)) return value.content.map(textValue).filter(Boolean).join(" ");
+     try {
+       return JSON.stringify(value);
+     } catch {

@@ -1,0 +1,179 @@
+diff --git a/open-sse/config/runtimeConfig.js b/open-sse/config/runtimeConfig.js
+index 5191ba8..75f84d2 100644
+--- a/open-sse/config/runtimeConfig.js
++++ b/open-sse/config/runtimeConfig.js
+@@ -53,7 +53,7 @@ export const DIRECT_STREAM_IDLE_AFTER_PRODUCTIVE_MS = envMs("DIRECT_STREAM_IDLE_
+ export const DIRECT_STREAM_TOTAL_BUDGET_MS = envMs("DIRECT_STREAM_TOTAL_BUDGET_MS", 360 * 1000);
+ 
+ export const COMBO_STREAM_FIRST_BYTE_TIMEOUT_MS = envMs("COMBO_STREAM_FIRST_BYTE_TIMEOUT_MS", 3 * 1000);
+-export const COMBO_STREAM_FIRST_PRODUCTIVE_TIMEOUT_MS = envMs("COMBO_STREAM_FIRST_PRODUCTIVE_TIMEOUT_MS", 8 * 1000);
++export const COMBO_STREAM_FIRST_PRODUCTIVE_TIMEOUT_MS = envMs("COMBO_STREAM_FIRST_PRODUCTIVE_TIMEOUT_MS", 9 * 1000);
+ export const COMBO_STREAM_IDLE_AFTER_PRODUCTIVE_MS = envMs("COMBO_STREAM_IDLE_AFTER_PRODUCTIVE_MS", 120 * 1000);
+ export const COMBO_STREAM_TOTAL_BUDGET_MS = envMs("COMBO_STREAM_TOTAL_BUDGET_MS", 300 * 1000);
+ 
+@@ -119,4 +119,8 @@ export function shouldForceStreamUpstream(provider, model) {
+   if (FORCE_STREAM_UPSTREAM_PROVIDERS.has(provider)) return true;
+   if (model && FORCE_STREAM_UPSTREAM_MODELS.has(`${provider}/${model}`)) return true;
+   return false;
+-}
+\ No newline at end of file
++}
++// Fixed-tick preflight: poll every 3s, 2-tier caps for fast fallback
++export const PREFLIGHT_TICK_MS = Number(process.env.PREFLIGHT_TICK_MS) || 3000;
++export const PREFLIGHT_NO_BYTE_CAP_MS = Number(process.env.PREFLIGHT_NO_BYTE_CAP_MS) || 6000;
++export const PREFLIGHT_NO_CONTENT_CAP_MS = Number(process.env.PREFLIGHT_NO_CONTENT_CAP_MS) || 9000;
+\ No newline at end of file
+diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
+index c200a06..61905a8 100644
+--- a/open-sse/handlers/chatCore/streamingHandler.js
++++ b/open-sse/handlers/chatCore/streamingHandler.js
+@@ -4,7 +4,7 @@ import { createSSETransformStreamWithLogger, createPassthroughStreamWithLogger }
+ import { pipeWithDisconnect } from "../../utils/streamHandler.js";
+ import { parseSSELine } from "../../utils/streamHelpers.js";
+ import { PROVIDERS } from "../../config/providers.js";
+-import { HTTP_STATUS } from "../../config/runtimeConfig.js";
++import { HTTP_STATUS, PREFLIGHT_TICK_MS, PREFLIGHT_NO_BYTE_CAP_MS, PREFLIGHT_NO_CONTENT_CAP_MS } from "../../config/runtimeConfig.js";
+ import { buildAbortedResponsesTerminalBytes } from "../../utils/responsesStreamHelpers.js";
+ import { createErrorResult } from "../../utils/error.js";
+ import { buildRequestDetail, extractRequestConfig, saveUsageStats } from "./requestDetail.js";
+@@ -85,54 +85,116 @@ async function readWithDeadline(reader, ms, reason) {
+   }
+ }
+ 
++function isSemanticEvent(parsed) {
++  if (!parsed) return false;
++  const t = parsed.type || "";
++  if (["response.created", "response.in_progress", "message_start", "message_delta", "content_block_start", "content_block_delta"].includes(t)) return true;
++  if (parsed.choices?.[0]?.delta?.role === "assistant") return true;
++  return false;
++}
++
++function isHeartbeatChunk(line, parsed) {
++  if (!line) return false;
++  const s = typeof line === "string" ? line : "";
++  if (s.trim().length === 0) return true;
++  if (s.startsWith(":")) return true;
++  if (parsed?.type === "ping") return true;
++  return false;
++}
+ export async function guardInitialStream(providerResponse, { targetFormat, log, provider, model, policy }) {
+   if (!providerResponse.body) return { response: providerResponse };
+-  const cfg = policy || {};
+-  const now = Date.now();
+-  const firstByteDeadline = now + (cfg.firstByteTimeoutMs || 10000);
+-  const firstProductiveDeadline = now + (cfg.firstProductiveTimeoutMs || 90000);
+-  const totalDeadline = now + (cfg.totalBudgetMs || 360000);
+   const reader = providerResponse.body.getReader();
+   const decoder = new TextDecoder("utf-8", { fatal: false });
++  const startTime = Date.now();
+   const bufferedChunks = [];
+   let buffer = "";
+-  let sawByte = false;
++  let hasByte = false;
++  let lastByteTime = startTime;
++  let pendingRead = reader.read();
+   try {
+     while (true) {
+-      const deadline = Math.min(totalDeadline, sawByte ? firstProductiveDeadline : firstByteDeadline, firstProductiveDeadline);
+-      const left = deadline - Date.now();
+-      if (left <= 0) {
+-        const reason = !sawByte ? "first byte timeout" : "first productive timeout";
+-        throw new Error("Upstream " + reason);
++      const now = Date.now();
++      if (!hasByte && now - lastByteTime > PREFLIGHT_NO_BYTE_CAP_MS) {
++        throw new Error("Upstream first byte timeout (6s)");
++      }
++      if (hasByte && now - lastByteTime > PREFLIGHT_NO_CONTENT_CAP_MS) {
++        throw new Error("Upstream first productive timeout (9s)");
++      }
++
++      let timer;
++      const timeoutPromise = new Promise(resolve => {
++        timer = setTimeout(() => resolve({ timedOut: true }), PREFLIGHT_TICK_MS);
++      });
++      const result = await Promise.race([
++        pendingRead.then(r => ({ done: r.done, value: r.value, timedOut: false })),
++        timeoutPromise,
++      ]);
++      clearTimeout(timer);
++
++      if (result.timedOut) {
++        // Fixed tick 3s: re-check same pendingRead; caps above handle fallback
++        continue;
++      }
++
++      pendingRead = null;
++      const { done, value } = result;
++      let foundProductive = false;
++      let foundTerminal = false;
++      let foundSemantic = false;
++      let foundHeartbeat = false;
++
++      if (done) {
++        if (foundProductive) {
++          const body = replayBufferedBody(reader, bufferedChunks);
++          return { response: new Response(body, { status: providerResponse.status, statusText: providerResponse.statusText, headers: providerResponse.headers }) };
++        }
++        throw new Error("Empty upstream stream (terminal before productive)");
++      }
++
++      if (value && (value.byteLength || value.length || 0) > 0) {
++        lastByteTime = Date.now();
++        hasByte = true;
+       }
+-      const { done, value } = await readWithDeadline(reader, left, sawByte ? "Upstream first productive timeout" : "Upstream first byte timeout");
+-      if (done) break;
+-      if (value && (value.byteLength || value.length || 0) > 0) sawByte = true;
+       bufferedChunks.push(value);
+       buffer += decoder.decode(value, { stream: true });
+       const lines = buffer.split("\n");
+       buffer = lines.pop() || "";
++
+       for (const line of lines) {
+         const trimmed = line.trim();
+-        if (!trimmed || trimmed.startsWith(":")) continue;
++        if (!trimmed || trimmed.startsWith(":")) { foundHeartbeat = true; continue; }
+         const parsed = parseSSELine(trimmed, targetFormat) || parseSSELine(trimmed, FORMATS.OPENAI);
+         if (!parsed) continue;
+-        if (isProductiveStreamChunk(parsed, targetFormat)) {
+-          const body = replayBufferedBody(reader, bufferedChunks);
+-          return { response: new Response(body, { status: providerResponse.status, statusText: providerResponse.statusText, headers: providerResponse.headers }) };
+-        }
+-        if (isTerminalStreamChunk(parsed)) {
+-          await reader.cancel().catch(() => {});
+-          return { error: "Empty upstream stream before content", status: HTTP_STATUS.BAD_GATEWAY };
+-        }
++        if (isProductiveStreamChunk(parsed, targetFormat)) { foundProductive = true; break; }
++        if (isTerminalStreamChunk(parsed)) { foundTerminal = true; break; }
++        if (isSemanticEvent(parsed)) { foundSemantic = true; }
++        else if (isHeartbeatChunk(trimmed, parsed)) { foundHeartbeat = true; }
+       }
++
++      if (foundProductive) {
++        const body = replayBufferedBody(reader, bufferedChunks);
++        return { response: new Response(body, { status: providerResponse.status, statusText: providerResponse.statusText, headers: providerResponse.headers }) };
++      }
++
++      if (foundTerminal) {
++        await reader.cancel().catch(() => {});
++        return { error: "Empty upstream stream before content", status: HTTP_STATUS.BAD_GATEWAY };
++      }
++
++      // foundSemantic / foundHeartbeat: hasByte = true, reset lastByteTime
++      // Cap: hasByte -> 9s no content -> fallback
++      if (foundSemantic || foundHeartbeat) {
++        lastByteTime = Date.now();
++      }
++
++      pendingRead = reader.read();
+     }
+   } catch (error) {
+     await reader.cancel().catch(() => {});
+     return { error: error.message || "Upstream stream preflight failed", status: HTTP_STATUS.BAD_GATEWAY };
+   }
+   await reader.cancel().catch(() => {});
+-  const suffix = sawByte ? "before content" : "without bytes";
++  const suffix = hasByte ? "before content" : "without bytes";
+   log?.warn?.("STREAM", (provider?.toUpperCase?.() || provider) + " | " + model + " | empty " + suffix);
+   return { error: "Empty upstream stream " + suffix, status: HTTP_STATUS.BAD_GATEWAY };
+ }

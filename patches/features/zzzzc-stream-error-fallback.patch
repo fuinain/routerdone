@@ -1,0 +1,83 @@
+diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
+--- a/open-sse/handlers/chatCore/streamingHandler.js
++++ b/open-sse/handlers/chatCore/streamingHandler.js
+@@ -57,6 +57,46 @@
+   if (["message_stop", "response.completed", "response.failed", "response.incomplete"].includes(chunk.type)) return true;
+   if (chunk.response?.candidates?.[0]?.finishReason || chunk.candidates?.[0]?.finishReason) return true;
+   return false;
++}
++
++// Detect error chunks in SSE stream ? upstream may return 200 OK but embed
++// an error object in the stream body. Without this check the preflight would
++// either accept the error as content or silently ignore it until timeout.
++export function isErrorStreamChunk(chunk) {
++  if (!chunk) return false;
++  if (chunk.error) return true;
++  if (chunk.type === "error") return true;
++  if (chunk.choices?.[0]?.error) return true;
++  if (chunk.response?.error) return true;
++  return false;
++}
++
++// Extract human-readable message from an error chunk for logging/fallback.
++export function extractStreamErrorMessage(chunk) {
++  if (typeof chunk?.error === "string") return chunk.error;
++  if (chunk?.error?.message) return chunk.error.message;
++  if (chunk?.choices?.[0]?.error?.message) return chunk.choices[0].error.message;
++  if (chunk?.response?.error?.message) return chunk.response.error.message;
++  return "Upstream error in stream";
++}
++
++export function extractStreamErrorStatus(chunk, message) {
++  const candidates = [
++    chunk?.status,
++    chunk?.statusCode,
++    chunk?.error?.status,
++    chunk?.error?.statusCode,
++    chunk?.error?.code,
++    chunk?.choices?.[0]?.error?.status,
++    chunk?.response?.error?.status,
++  ];
++  for (const value of candidates) {
++    const parsed = Number.parseInt(value, 10);
++    if (Number.isFinite(parsed) && parsed >= 400 && parsed <= 599) return parsed;
++  }
++  const text = String(message || "").toLowerCase();
++  if (text.includes("429") || text.includes("too many requests") || text.includes("rate limit") || text.includes("quota")) return HTTP_STATUS.RATE_LIMITED;
++  return HTTP_STATUS.BAD_GATEWAY;
+ }
+ 
+ function replayBufferedBody(reader, bufferedChunks) {
+@@ -162,6 +202,9 @@
+       let foundTerminal = false;
+       let foundSemantic = false;
+       let foundHeartbeat = false;
++      let foundError = false;
++      let streamErrorMsg = null;
++      let streamErrorStatus = HTTP_STATUS.BAD_GATEWAY;
+ 
+       if (done) {
+         if (foundProductive) {
+@@ -189,10 +232,22 @@
+         if (!trimmed || trimmed.startsWith(":")) { foundHeartbeat = true; continue; }
+         const parsed = parseSSELine(trimmed, targetFormat) || parseSSELine(trimmed, FORMATS.OPENAI);
+         if (!parsed) continue;
++        if (isErrorStreamChunk(parsed)) {
++          foundError = true;
++          streamErrorMsg = extractStreamErrorMessage(parsed);
++          streamErrorStatus = extractStreamErrorStatus(parsed, streamErrorMsg);
++          break;
++        }
+         if (isProductiveStreamChunk(parsed, targetFormat)) { foundProductive = true; break; }
+         if (isTerminalStreamChunk(parsed)) { foundTerminal = true; break; }
+         if (isSemanticEvent(parsed)) { foundSemantic = true; }
+         else if (isHeartbeatChunk(trimmed, parsed)) { foundHeartbeat = true; }
++      }
++
++      if (foundError) {
++        await reader.cancel().catch(() => {});
++        logPreflight("warn", "failed", `reason=error_chunk: ${JSON.stringify(streamErrorMsg)}`);
++        return { error: `Upstream stream error: ${streamErrorMsg}`, status: streamErrorStatus };
+       }
+ 
+       if (foundProductive) {

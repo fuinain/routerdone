@@ -1,0 +1,303 @@
+diff --git a/open-sse/handlers/chatCore/streamingHandler.js b/open-sse/handlers/chatCore/streamingHandler.js
+index a4dbd70..8840165 100644
+--- a/open-sse/handlers/chatCore/streamingHandler.js
++++ b/open-sse/handlers/chatCore/streamingHandler.js
+@@ -101,11 +101,31 @@ function isHeartbeatChunk(line, parsed) {
+   if (parsed?.type === "ping") return true;
+   return false;
+ }
+-export async function guardInitialStream(providerResponse, { targetFormat, log, provider, model, policy }) {
++export async function guardInitialStream(providerResponse, { targetFormat, log, provider, model, policy, routeInfo }) {
+   if (!providerResponse.body) return { response: providerResponse };
+   const reader = providerResponse.body.getReader();
+   const decoder = new TextDecoder("utf-8", { fatal: false });
+   const startTime = Date.now();
++  const timing = {
++    firstByteAt: null,
++    lastNonProductiveAt: null,
++    acceptedAt: null,
++    byteCount: 0,
++  };
++  const formatTiming = () => [
++    routeInfo?.comboRunId ? `run=${routeInfo.comboRunId}` : null,
++    `provider=${provider || "unknown"}`,
++    `model=${model || "unknown"}`,
++    `preflight_elapsed=${Date.now() - startTime}ms`,
++    `first_byte_at=${timing.firstByteAt ? timing.firstByteAt - startTime : -1}ms`,
++    `last_non_productive_at=${timing.lastNonProductiveAt ? timing.lastNonProductiveAt - startTime : -1}ms`,
++    `accepted_at=${timing.acceptedAt ? timing.acceptedAt - startTime : -1}ms`,
++    `bytes=${timing.byteCount}`,
++  ].filter(Boolean).join(" | ");
++  const logPreflight = (level, event, extra = "") => {
++    const suffix = extra ? ` | ${extra}` : "";
++    log?.[level]?.("PREFLIGHT", `${event} | ${formatTiming()}${suffix}`);
++  };
+   const bufferedChunks = [];
+   let buffer = "";
+   let hasByte = false;
+@@ -151,8 +171,12 @@ export async function guardInitialStream(providerResponse, { targetFormat, log,
+         throw new Error("Empty upstream stream (terminal before productive)");
+       }
+ 
+-      if (value && (value.byteLength || value.length || 0) > 0) {
+-        lastByteTime = Date.now();
++      const bytes = value ? (value.byteLength || value.length || 0) : 0;
++      if (bytes > 0) {
++        const byteTime = Date.now();
++        if (!timing.firstByteAt) timing.firstByteAt = byteTime;
++        timing.byteCount += bytes;
++        lastByteTime = byteTime;
+         hasByte = true;
+       }
+       bufferedChunks.push(value);
+@@ -172,25 +196,30 @@ export async function guardInitialStream(providerResponse, { targetFormat, log,
+       }
+ 
+       if (foundProductive) {
++        timing.acceptedAt = Date.now();
++        logPreflight("info", "accepted");
+         const body = replayBufferedBody(reader, bufferedChunks);
+         return { response: new Response(body, { status: providerResponse.status, statusText: providerResponse.statusText, headers: providerResponse.headers }) };
+       }
+ 
+       if (foundTerminal) {
+         await reader.cancel().catch(() => {});
++        logPreflight("warn", "failed", "reason=terminal_before_content");
+         return { error: "Empty upstream stream before content", status: HTTP_STATUS.BAD_GATEWAY };
+       }
+ 
+       // foundSemantic / foundHeartbeat: hasByte = true, reset lastByteTime
+       // Cap: hasByte -> 9s no content -> fallback
+       if (foundSemantic || foundHeartbeat) {
+-        lastByteTime = Date.now();
++        timing.lastNonProductiveAt = Date.now();
++        lastByteTime = timing.lastNonProductiveAt;
+       }
+ 
+       pendingRead = reader.read();
+     }
+   } catch (error) {
+     await reader.cancel().catch(() => {});
++    logPreflight("warn", "failed", `reason=${JSON.stringify(error.message || "Upstream stream preflight failed")}`);
+     return { error: error.message || "Upstream stream preflight failed", status: HTTP_STATUS.BAD_GATEWAY };
+   }
+   await reader.cancel().catch(() => {});
+@@ -214,7 +243,7 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
+ }
+ 
+ export async function handleStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, userAgent, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, streamController, onStreamComplete, log, streamTimeoutPolicy, routeInfo }) {
+-  const guarded = await guardInitialStream(providerResponse, { targetFormat, log, provider, model, policy: streamTimeoutPolicy });
++  const guarded = await guardInitialStream(providerResponse, { targetFormat, log, provider, model, policy: streamTimeoutPolicy, routeInfo });
+   if (guarded.error) {
+     streamController.handleError(new Error(guarded.error));
+     return createErrorResult(guarded.status, guarded.error);
+diff --git a/open-sse/rtk/index.js b/open-sse/rtk/index.js
+index dd1e501..104ee19 100644
+--- a/open-sse/rtk/index.js
++++ b/open-sse/rtk/index.js
+@@ -3,6 +3,10 @@
+ import { RAW_CAP, MIN_COMPRESS_SIZE } from "./constants.js";
+ import { autoDetectFilter } from "./autodetect.js";
+ import { safeApply } from "./applyFilter.js";
++import { smartTruncate } from "./filters/smartTruncate.js";
++
++const WEAK_COMPRESS_MIN_BYTES = 100_000;
++const WEAK_COMPRESS_MAX_SAVED_RATIO = 0.05;
+ 
+ // Compress tool_result content in-place. Returns stats or null if disabled/failed.
+ export function compressMessages(body, enabled) {
+@@ -132,7 +136,16 @@ function compressText(text, stats, shape) {
+     return text;
+   }
+ 
+-  const out = safeApply(fn, text);
++  let out = safeApply(fn, text);
++  let filterName = fn.filterName || fn.name;
++  const savedRatio = out && out.length > 0 ? (bytesIn - out.length) / bytesIn : 0;
++  if (out && out.length > 0 && out.length < bytesIn && bytesIn >= WEAK_COMPRESS_MIN_BYTES && savedRatio < WEAK_COMPRESS_MAX_SAVED_RATIO && fn !== smartTruncate) {
++    const fallbackOut = safeApply(smartTruncate, text);
++    if (fallbackOut && fallbackOut.length > 0 && fallbackOut.length < out.length) {
++      out = fallbackOut;
++      filterName = smartTruncate.filterName || smartTruncate.name;
++    }
++  }
+ 
+   // Safety: never return empty, never grow the input
+   if (!out || out.length === 0 || out.length >= bytesIn) {
+@@ -141,7 +154,7 @@ function compressText(text, stats, shape) {
+   }
+ 
+   stats.bytesAfter += out.length;
+-  stats.hits.push({ shape, filter: fn.filterName || fn.name, saved: bytesIn - out.length });
++  stats.hits.push({ shape, filter: filterName, saved: bytesIn - out.length });
+   return out;
+ }
+ 
+diff --git a/open-sse/services/combo.js b/open-sse/services/combo.js
+index f6cdd69..2bb21c4 100644
+--- a/open-sse/services/combo.js
++++ b/open-sse/services/combo.js
+@@ -15,6 +15,35 @@ const HARD_CAPS = new Set(["vision", "pdf", "audioInput", "videoInput"]);
+ // Prefixes used when flattening tool turns into plain prose for panel models.
+ const TOOL_CALL_PREFIX = "[Called tools: ";
+ const TOOL_RESULT_PREFIX = "[Tool result: ";
++const comboModelCooldowns = new Map();
++const DEFAULT_COMBO_MODEL_COOLDOWN_MS = 30_000;
++
++function resolveComboModelCooldownMs() {
++  const raw = globalThis.process?.env?.COMBO_MODEL_COOLDOWN_MS;
++  const parsed = Number.parseInt(raw || "", 10);
++  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_COMBO_MODEL_COOLDOWN_MS;
++}
++
++function getComboCooldownUntil(modelStr) {
++  const now = Date.now();
++  for (const [key, until] of comboModelCooldowns) {
++    if (!until || until <= now) comboModelCooldowns.delete(key);
++  }
++  return comboModelCooldowns.get(modelStr) || 0;
++}
++
++function markComboCooldown(modelStr) {
++  const cooldownMs = resolveComboModelCooldownMs();
++  if (cooldownMs <= 0) return 0;
++  const until = Date.now() + cooldownMs;
++  comboModelCooldowns.set(modelStr, until);
++  return until;
++}
++
++function isPreflightTimeoutText(errorText) {
++  const text = String(errorText || "").toLowerCase();
++  return text.includes("upstream first byte timeout") || text.includes("upstream first productive timeout");
++}
+ 
+ // Flatten tool turns into prose so panel models keep the context but can't loop
+ // on tools: drop the request's tools, turn tool/function results into assistant
+@@ -255,10 +284,12 @@ export function getComboModelsFromData(modelStr, combosData) {
+  */
+ export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, comboRetryAttempts, comboRetryDelayMs, comboPreflightTimeoutMs, autoSwitch = true }) {
+   const startedAt = Date.now();
++  const comboRunId = `combo-${startedAt.toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
++  const comboLogPrefix = `run=${comboRunId}`;
+   const summary = { tried: 0, skipped: 0, failed: 0 };
+   const logSummary = (tail) => {
+     const durationMs = Date.now() - startedAt;
+-    log.info("COMBO", `summary | combo=${comboName || body?.model || "unknown"} | ${tail} | tried=${summary.tried} | skipped=${summary.skipped} | failed=${summary.failed} | duration=${durationMs}ms`);
++    log.info("COMBO", `${comboLogPrefix} | summary | combo=${comboName || body?.model || "unknown"} | ${tail} | tried=${summary.tried} | skipped=${summary.skipped} | failed=${summary.failed} | duration=${durationMs}ms`);
+   };
+   // Apply rotation strategy if enabled
+   let rotatedModels = getRotatedModels(models, comboName, comboStrategy, comboStickyLimit);
+@@ -269,7 +300,7 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
+     if (required.size > 0) {
+       const reordered = reorderByCapabilities(rotatedModels, required);
+       if (reordered[0] !== rotatedModels[0]) {
+-        log.info("COMBO", `auto-switch for [${[...required].join(",")}] → ${reordered[0]}`);
++        log.info("COMBO", `${comboLogPrefix} | auto-switch for [${[...required].join(",")}] → ${reordered[0]}`);
+       }
+       rotatedModels = reordered;
+     }
+@@ -292,8 +323,14 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
+       break;
+     }
+     const modelStr = rotatedModels[i];
++    const cooldownUntil = getComboCooldownUntil(modelStr);
++    if (cooldownUntil > Date.now()) {
++      summary.skipped++;
++      log.info("COMBO", `${comboLogPrefix} | skip cooldown model=${modelStr} until=${new Date(cooldownUntil).toISOString()}`);
++      continue;
++    }
+     summary.tried++;
+-    log.info("COMBO", `Trying model ${i + 1}/${rotatedModels.length}: ${modelStr}`);
++    log.info("COMBO", `${comboLogPrefix} | Trying model ${i + 1}/${rotatedModels.length}: ${modelStr}`);
+ 
+     try {
+       let result;
+@@ -301,6 +338,7 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
+ 
+       while (true) {
+         result = await handleSingleModel(body, modelStr, {
++          comboRunId,
+           comboName,
+           requestedModel: comboName || body?.model || null,
+           attemptModel: modelStr,
+@@ -318,13 +356,13 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
+         attempt++;
+         const remainingMs = totalDeadline - Date.now();
+         if (remainingMs <= retryDelayMs + policy.stream.firstProductiveTimeoutMs) break;
+-        log.info("COMBO", `Model ${modelStr} transient ${result.status}, retry ${attempt}/${retryAttempts} after ${retryDelayMs / 1000}s`);
++        log.info("COMBO", `${comboLogPrefix} | Model ${modelStr} transient ${result.status}, retry ${attempt}/${retryAttempts} after ${retryDelayMs / 1000}s`);
+         if (retryDelayMs > 0) await new Promise(r => setTimeout(r, Math.min(retryDelayMs, Math.max(0, totalDeadline - Date.now()))));
+       }
+       
+       // Success (2xx) - return response
+       if (result.ok) {
+-        log.info("COMBO", `Model ${modelStr} accepted stream`);
++        log.info("COMBO", `${comboLogPrefix} | Model ${modelStr} accepted stream`);
+         logSummary(`success=${modelStr}`);
+         return result;
+       }
+@@ -352,13 +390,20 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
+         try { errorText = JSON.stringify(errorText); } catch { errorText = String(errorText); }
+       }
+ 
++      if (isPreflightTimeoutText(errorText)) {
++        const cooldownUntil = markComboCooldown(modelStr);
++        if (cooldownUntil) {
++          log.warn("COMBO", `${comboLogPrefix} | cooldown model=${modelStr} until=${new Date(cooldownUntil).toISOString()} reason=preflight_timeout`, { status: result.status });
++        }
++      }
++
+       // Check if should fallback to next model
+       const { shouldFallback, cooldownMs } = checkFallbackError(result.status, errorText);
+ 
+       if (!shouldFallback) {
+         summary.failed++;
+         logSummary(`stopped=${modelStr} | last_status=${result.status}`);
+-        log.warn("COMBO", `Model ${modelStr} failed (no fallback)`, { status: result.status });
++        log.warn("COMBO", `${comboLogPrefix} | Model ${modelStr} failed (no fallback)`, { status: result.status });
+         return result;
+       }
+ 
+@@ -366,13 +411,13 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
+       summary.failed++;
+       lastError = errorText || String(result.status);
+       if (!lastStatus) lastStatus = result.status;
+-      log.warn("COMBO", `Model ${modelStr} failed, trying next`, { status: result.status });
++      log.warn("COMBO", `${comboLogPrefix} | Model ${modelStr} failed, trying next`, { status: result.status });
+     } catch (error) {
+       // Catch unexpected exceptions to ensure fallback continues
+       summary.failed++;
+       lastError = error.message || String(error);
+       if (!lastStatus) lastStatus = 500;
+-      log.warn("COMBO", `Model ${modelStr} threw error, trying next`, { error: lastError });
++      log.warn("COMBO", `${comboLogPrefix} | Model ${modelStr} threw error, trying next`, { error: lastError });
+     }
+   }
+ 
+@@ -387,12 +432,12 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
+   if (earliestRetryAfter) {
+     const retryHuman = formatRetryAfter(earliestRetryAfter);
+     logSummary(`all_failed | last_status=${status}`);
+-    log.warn("COMBO", `All models failed | ${msg} (${retryHuman})`);
++    log.warn("COMBO", `${comboLogPrefix} | All models failed | ${msg} (${retryHuman})`);
+     return unavailableResponse(status, msg, earliestRetryAfter, retryHuman);
+   }
+ 
+   logSummary(`all_failed | last_status=${status}`);
+-  log.warn("COMBO", `All models failed | ${msg}`);
++  log.warn("COMBO", `${comboLogPrefix} | All models failed | ${msg}`);
+   return new Response(
+     JSON.stringify({ error: { message: msg } }),
+     { status, headers: { "Content-Type": "application/json" } }
+diff --git a/src/sse/handlers/chat.js b/src/sse/handlers/chat.js
+index 7fa2ebf..80ab83d 100644
+--- a/src/sse/handlers/chat.js
++++ b/src/sse/handlers/chat.js
+@@ -267,6 +267,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
+     const routeInfo = {
+       requestedModel: attemptContext.requestedModel || body.model || modelStr,
+       comboName: attemptContext.comboName || null,
++      comboRunId: attemptContext.comboRunId || null,
+       attemptModel: attemptContext.attemptModel || modelStr,
+       attemptIndex: attemptContext.attemptIndex || 1,
+       attemptTotal: attemptContext.attemptTotal || 1,

@@ -1,0 +1,84 @@
+diff --git a/open-sse/config/errorConfig.js b/open-sse/config/errorConfig.js
+index f3ec79b..f83bdd4 100644
+--- a/open-sse/config/errorConfig.js
++++ b/open-sse/config/errorConfig.js
+@@ -60,6 +60,10 @@ const COOLDOWN = {
+  *   - backoff: true = use exponential backoff (rate limit)
+  */
+ export const ERROR_RULES = [
++  // --- Transient stream errors: short cooldown, don't mark account dead long ---
++  { text: "empty upstream stream",             cooldownMs: 5 * 1000 },
++  { text: "upstream first productive timeout", cooldownMs: 5 * 1000 },
++  { text: "upstream stalled",                  cooldownMs: 5 * 1000 },
+   // --- Text-based rules (checked first, order = priority) ---
+   { text: "no credentials",           cooldownMs: COOLDOWN.long },
+   { text: "request not allowed",      cooldownMs: COOLDOWN.short },
+diff --git a/open-sse/config/runtimeConfig.js b/open-sse/config/runtimeConfig.js
+index b06f98b..5191ba8 100644
+--- a/open-sse/config/runtimeConfig.js
++++ b/open-sse/config/runtimeConfig.js
+@@ -98,3 +98,25 @@ export function resolveRetryEntry(entry) {
+ export const SKIP_PATTERNS = [
+   "Please write a 5-10 word title for the following conversation:"
+ ];
++
++// Providers only stable with stream:true upstream.
++// Non-stream -> 502/timeout. Gateway forces stream then converts SSE->JSON.
++// Add any provider here when the same symptom appears.
++export const FORCE_STREAM_UPSTREAM_PROVIDERS = new Set([
++  "openai",
++  "codex",
++  "commandcode",
++  // Add provider here when non-stream causes 502/timeout:
++  // just add the provider ID to this Set.
++]);
++
++// Model-specific override (if only some models are affected, not the whole provider)
++export const FORCE_STREAM_UPSTREAM_MODELS = new Set([
++  // "providerId/modelId",
++]);
++
++export function shouldForceStreamUpstream(provider, model) {
++  if (FORCE_STREAM_UPSTREAM_PROVIDERS.has(provider)) return true;
++  if (model && FORCE_STREAM_UPSTREAM_MODELS.has(`${provider}/${model}`)) return true;
++  return false;
++}
+\ No newline at end of file
+diff --git a/open-sse/handlers/chatCore.js b/open-sse/handlers/chatCore.js
+index f1bce86..28d655b 100644
+--- a/open-sse/handlers/chatCore.js
++++ b/open-sse/handlers/chatCore.js
+@@ -9,7 +9,7 @@ import { createRequestLogger } from "../utils/requestLogger.js";
+ import { getModelTargetFormat, getModelStrip, getModelUpstreamId, getModelType, PROVIDER_ID_TO_ALIAS } from "../config/providerModels.js";
+ import { PROVIDERS } from "../config/providers.js";
+ import { createErrorResult, parseUpstreamError, formatProviderError } from "../utils/error.js";
+-import { HTTP_STATUS } from "../config/runtimeConfig.js";
++import { HTTP_STATUS, shouldForceStreamUpstream } from "../config/runtimeConfig.js";
+ import { handleBypassRequest } from "../utils/bypassHandler.js";
+ import { resolveRoutePolicy } from "../services/routePolicy.js";
+ import { trackPendingRequest, appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
+@@ -74,7 +74,9 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+   }
+ 
+   const clientRequestedStreaming = body.stream === true || sourceFormat === FORMATS.ANTIGRAVITY || sourceFormat === FORMATS.GEMINI || sourceFormat === FORMATS.GEMINI_CLI;
+-  const providerRequiresStreaming = PROVIDERS[provider]?.forceStream === true;
++  const providerRequiresStreaming =
++  PROVIDERS[provider]?.forceStream === true
++  || shouldForceStreamUpstream(provider, model);
+   let stream = providerRequiresStreaming ? true : (body.stream !== false);
+ 
+   // Image generation models require non-streaming (Google v1internal:generateContent)
+@@ -338,7 +340,12 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
+ 
+   // Streaming response
+   const { onStreamComplete } = buildOnStreamComplete({ ...sharedCtx });
+-  return handleStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, streamController, onStreamComplete, log, streamTimeoutPolicy: resolvedStreamPolicy });
++  // Provider force-stream but client non-stream -> cap first productive timeout to detect mismatch fast
++  const streamTimeoutOverride = providerRequiresStreaming && !clientRequestedStreaming
++    ? { ...resolvedStreamPolicy, firstProductiveTimeoutMs: Math.min(resolvedStreamPolicy.firstProductiveTimeoutMs ?? 45000, 45000) }
++    : resolvedStreamPolicy;
++
++  return handleStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, streamController, onStreamComplete, log, streamTimeoutPolicy: streamTimeoutOverride });
+ }
+ 
+ export function isTokenExpiringSoon(expiresAt, bufferMs = 5 * 60 * 1000) {

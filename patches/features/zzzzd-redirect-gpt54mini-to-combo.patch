@@ -1,0 +1,39 @@
+diff --git a/src/sse/handlers/chat.js b/src/sse/handlers/chat.js
+--- a/src/sse/handlers/chat.js
++++ b/src/sse/handlers/chat.js
+@@ -17,6 +17,19 @@
+ import { handleBypassRequest } from "open-sse/utils/bypassHandler.js";
+ import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
+ import { resolveRoutePolicy } from "open-sse/services/routePolicy.js";
++
++const MODEL_REDIRECTS = new Map([
++  ["gpt-5.4-mini", "helper.fallback"],
++]);
++
++function resolveModelRedirect(modelStr, settings) {
++  const settingsRedirects = settings?.modelRedirects;
++  if (settingsRedirects && typeof settingsRedirects === "object") {
++    const override = settingsRedirects[modelStr];
++    if (typeof override === "string" && override.trim()) return override.trim();
++  }
++  return MODEL_REDIRECTS.get(modelStr) || null;
++}
+ import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
+ import * as log from "../utils/logger.js";
+ import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
+@@ -90,6 +103,15 @@
+   const userAgent = request?.headers?.get("user-agent") || "";
+   const bypassResponse = handleBypassRequest(body, modelStr, userAgent, !!settings.ccFilterNaming);
+   if (bypassResponse) return bypassResponse.response || bypassResponse;
++
++  // Redirect client-side helper/mini models to the configured combo fallback.
++  // This keeps Codex/CLI helper requests off providers that do not exist in this deployment.
++  const redirectedModel = resolveModelRedirect(modelStr, settings);
++  if (redirectedModel && redirectedModel !== modelStr) {
++    log.info("CHAT", `Redirecting model ${modelStr} -> ${redirectedModel}`);
++    modelStr = redirectedModel;
++    body = { ...body, model: redirectedModel };
++  }
+ 
+   // Check if model is a combo (has multiple models with fallback)
+   const comboModels = await getComboModels(modelStr);

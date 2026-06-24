@@ -1,0 +1,263 @@
+diff --git a/open-sse/rtk/autodetect.js b/open-sse/rtk/autodetect.js
+index 99ab6a7..417eb0a 100644
+--- a/open-sse/rtk/autodetect.js
++++ b/open-sse/rtk/autodetect.js
+@@ -1,7 +1,7 @@
+ // Port of auto_detect_filter (rtk/src/cmds/system/pipe_cmd.rs:132-188) + JS extras
+ // Order: git-diff → git-status → build-output → grep → find → tree → ls → search-list
+-//        → read-numbered → dedup-log → smart-truncate → null
+-import { DETECT_WINDOW, READ_NUMBERED_MIN_HIT_RATIO, SMART_TRUNCATE_MIN_LINES } from "./constants.js";
++//        → read-numbered → dedup-log → scored-truncate → null
++import { DETECT_WINDOW, READ_NUMBERED_MIN_HIT_RATIO, SMART_TRUNCATE_MIN_LINES, SCORED_MIN_LINES } from "./constants.js";
+ import { gitDiff } from "./filters/gitDiff.js";
+ import { gitStatus } from "./filters/gitStatus.js";
+ import { buildOutput } from "./filters/buildOutput.js";
+@@ -10,7 +10,7 @@ import { find } from "./filters/find.js";
+ import { dedupLog } from "./filters/dedupLog.js";
+ import { ls } from "./filters/ls.js";
+ import { tree } from "./filters/tree.js";
+-import { smartTruncate } from "./filters/smartTruncate.js";
++import { scoredTruncate } from "./filters/scoredTruncate.js";
+ import { readNumbered, READ_NUMBERED_LINE_RE } from "./filters/readNumbered.js";
+ import { searchList, SEARCH_LIST_HEADER_RE } from "./filters/searchList.js";
+ 
+@@ -62,8 +62,8 @@ export function autoDetectFilter(text) {
+   // Fallback: dedupLog for generic multi-line noise with duplicates
+   if (nonEmpty.length >= 5) return dedupLog;
+ 
+-  // Last resort: big blob with no structure — smart truncate
+-  if (text.split("\n").length >= SMART_TRUNCATE_MIN_LINES) return smartTruncate;
++  // Last resort: big blob with no structure — importance-scored truncate
++  if (text.split("\n").length >= SCORED_MIN_LINES) return scoredTruncate;
+ 
+   return null;
+ }
+diff --git a/open-sse/rtk/constants.js b/open-sse/rtk/constants.js
+index 752c2fe..4aef48e 100644
+--- a/open-sse/rtk/constants.js
++++ b/open-sse/rtk/constants.js
+@@ -37,7 +37,14 @@ export const SEARCH_LIST_TOTAL_DIR_MAX = 20;
+ // Smart truncate (port of filter.rs smart_truncate fallback)
+ export const SMART_TRUNCATE_HEAD = 120;        // lines kept from top
+ export const SMART_TRUNCATE_TAIL = 60;         // lines kept from bottom
+-export const SMART_TRUNCATE_MIN_LINES = 250;   // only kick in above this
++export const SMART_TRUNCATE_MIN_LINES = 250;
++
++// Scored truncate (importance-based fallback, replaces smart-truncate as default)
++export const SCORED_HEAD = 40;              // lines kept from top
++export const SCORED_TAIL = 30;              // lines kept from bottom
++export const SCORED_MIN_LINES = 150;       // only kick in above this
++export const SCORED_THRESHOLD = 2;         // minimum score to keep a middle line
++export const SCORED_MAX_KEEP = 200;        // hard cap on total output lines
+ 
+ // readNumbered (files with "  N|content" lines, e.g. Cursor read_file)
+ export const READ_NUMBERED_MIN_HIT_RATIO = 0.7;
+@@ -53,6 +60,7 @@ export const FILTERS = {
+   TREE: "tree",
+   DEDUP_LOG: "dedup-log",
+   SMART_TRUNCATE: "smart-truncate",
++  SCORED_TRUNCATE: "scored-truncate",
+   READ_NUMBERED: "read-numbered",
+   SEARCH_LIST: "search-list",
+   BUILD_OUTPUT: "build-output"
+diff --git a/open-sse/rtk/filters/scoredTruncate.js b/open-sse/rtk/filters/scoredTruncate.js
+new file mode 100644
+index 0000000..56c9619
+--- /dev/null
++++ b/open-sse/rtk/filters/scoredTruncate.js
+@@ -0,0 +1,67 @@
++// Importance-scored truncation: keeps high-value lines from the middle
++// instead of blindly cutting everything between head and tail.
++// Replaces smart-truncate as the final RTK fallback for unstructured blobs.
++import { SCORED_HEAD, SCORED_TAIL, SCORED_MIN_LINES, SCORED_THRESHOLD, SCORED_MAX_KEEP } from "../constants.js";
++
++const RE_ERROR = /\b(error|fail|exception|assert|traceback|panic|fatal|crash)\b|❌|✗|✘/i;
++const RE_STACK = /^\s+(at\s+|File "|#\d+\s)/m;
++const RE_RESULT = /\d+%\s|passing|failing|✓|✔|passed|failed|\b\d+\/\d+\b/i;
++const RE_PATH_URL = /https?:\/\/|[\/\\]\w+\.\w{2,4}/;
++const RE_SEPARATOR = /^[-=*_~]{3,}$|^\s*#{1,3}\s/m;
++const RE_JSON_KEY = /"\w+"\s*:\s*[^\[{[]/;
++const RE_NOISE = /^\s*(console\.|print\(|log\(|\/\/|\/\*|\*\/|#\s)/;
++
++function scoreLine(line, prevTrimmed) {
++  const trimmed = line.trim();
++  if (!trimmed) return -2;
++  let score = 0;
++  if (RE_ERROR.test(trimmed)) score += 5;
++  if (RE_STACK.test(line)) score += 3;
++  if (RE_RESULT.test(trimmed)) score += 2;
++  if (RE_PATH_URL.test(trimmed)) score += 2;
++  if (RE_SEPARATOR.test(trimmed)) score += 1;
++  if (RE_JSON_KEY.test(trimmed)) score += 1;
++  if (RE_NOISE.test(trimmed)) score -= 1;
++  if (prevTrimmed && trimmed === prevTrimmed) score -= 4;
++  return score;
++}
++
++function compressMiddle(middle, threshold, head, tail) {
++  const kept = [];
++  let omitted = 0;
++  let prevTrimmed = null;
++  for (const line of middle) {
++    const s = scoreLine(line, prevTrimmed);
++    if (s >= threshold) {
++      if (omitted > 0) { kept.push(`... +${omitted} lines omitted`); omitted = 0; }
++      kept.push(line);
++    } else {
++      omitted++;
++    }
++    prevTrimmed = line.trim();
++  }
++  if (omitted > 0) kept.push(`... +${omitted} lines omitted`);
++  return [...head, ...kept, ...tail];
++}
++
++export function scoredTruncate(input) {
++  const lines = input.split("\n");
++  if (lines.length < SCORED_MIN_LINES) return input;
++
++  const head = lines.slice(0, SCORED_HEAD);
++  const tail = lines.slice(lines.length - SCORED_TAIL);
++  const middle = lines.slice(SCORED_HEAD, lines.length - SCORED_TAIL);
++
++  let threshold = SCORED_THRESHOLD;
++  let result = compressMiddle(middle, threshold, head, tail);
++
++  // Escalate threshold if still too long
++  while (result.length > SCORED_MAX_KEEP && threshold < 10) {
++    threshold += 2;
++    result = compressMiddle(middle, threshold, head, tail);
++  }
++
++  return result.join("\n");
++}
++
++scoredTruncate.filterName = "scored-truncate";
+diff --git a/open-sse/rtk/index.js b/open-sse/rtk/index.js
+index 104ee19..7a41c40 100644
+--- a/open-sse/rtk/index.js
++++ b/open-sse/rtk/index.js
+@@ -3,7 +3,7 @@
+ import { RAW_CAP, MIN_COMPRESS_SIZE } from "./constants.js";
+ import { autoDetectFilter } from "./autodetect.js";
+ import { safeApply } from "./applyFilter.js";
+-import { smartTruncate } from "./filters/smartTruncate.js";
++import { scoredTruncate } from "./filters/scoredTruncate.js";
+ 
+ const WEAK_COMPRESS_MIN_BYTES = 100_000;
+ const WEAK_COMPRESS_MAX_SAVED_RATIO = 0.05;
+@@ -25,6 +25,20 @@ export function compressMessages(body, enabled) {
+   if (!items) return null;
+ 
+   const stats = { bytesBefore: 0, bytesAfter: 0, hits: [] };
++  const seen = new Set(); // cross-message tool result dedup
++  const compress = (text, shape) => {
++    if (typeof text !== "string" || text.length < MIN_COMPRESS_SIZE) return compressText(text, stats, shape);
++    const fp = text.length + ":" + text.slice(0, 300);
++    if (seen.has(fp)) {
++      const rep = `[RTK: duplicate tool result omitted (${text.length}B)]`;
++      stats.bytesBefore += text.length;
++      stats.bytesAfter += rep.length;
++      stats.hits.push({ shape, filter: "cross-dedup", saved: text.length - rep.length });
++      return rep;
++    }
++    seen.add(fp);
++    return compressText(text, stats, shape);
++  };
+   try {
+     for (let i = 0; i < items.length; i++) {
+       const msg = items[i];
+@@ -33,12 +47,12 @@ export function compressMessages(body, enabled) {
+       // Shape 4: OpenAI Responses — top-level { type:"function_call_output", output: string | [{type:"input_text", text}] }
+       if (msg.type === "function_call_output") {
+         if (typeof msg.output === "string") {
+-          msg.output = compressText(msg.output, stats, "openai-responses-string");
++          msg.output = compress(msg.output, "openai-responses-string");
+         } else if (Array.isArray(msg.output)) {
+           for (let k = 0; k < msg.output.length; k++) {
+             const part = msg.output[k];
+             if (part && part.type === "input_text" && typeof part.text === "string") {
+-              part.text = compressText(part.text, stats, "openai-responses-array");
++              part.text = compress(part.text, "openai-responses-array");
+             }
+           }
+         }
+@@ -47,7 +61,7 @@ export function compressMessages(body, enabled) {
+ 
+       // Shape 1: OpenAI tool message — { role:"tool", content: "string" }
+       if (msg.role === "tool" && typeof msg.content === "string") {
+-        msg.content = compressText(msg.content, stats, "openai-tool");
++        msg.content = compress(msg.content, "openai-tool");
+         continue;
+       }
+ 
+@@ -58,7 +72,7 @@ export function compressMessages(body, enabled) {
+         for (let k = 0; k < msg.content.length; k++) {
+           const part = msg.content[k];
+           if (part && part.type === "text" && typeof part.text === "string") {
+-            part.text = compressText(part.text, stats, "openai-tool-array");
++            part.text = compress(part.text, "openai-tool-array");
+           }
+         }
+         continue;
+@@ -72,13 +86,13 @@ export function compressMessages(body, enabled) {
+ 
+         if (typeof block.content === "string") {
+           // Shape 2: claude string form
+-          block.content = compressText(block.content, stats, "claude-string");
++          block.content = compress(block.content, "claude-string");
+         } else if (Array.isArray(block.content)) {
+           // Shape 3: claude array form — compress each text part
+           for (let k = 0; k < block.content.length; k++) {
+             const part = block.content[k];
+             if (part && part.type === "text" && typeof part.text === "string") {
+-              part.text = compressText(part.text, stats, "claude-array");
++              part.text = compress(part.text, "claude-array");
+             }
+           }
+         }
+@@ -94,6 +108,20 @@ export function compressMessages(body, enabled) {
+ // Compress Kiro format: conversationState.history[].userInputMessage.userInputMessageContext.toolResults[].content[].text
+ function compressKiroFormat(body, enabled) {
+   const stats = { bytesBefore: 0, bytesAfter: 0, hits: [] };
++  const seen = new Set();
++  const compress = (text, shape) => {
++    if (typeof text !== "string" || text.length < MIN_COMPRESS_SIZE) return compressText(text, stats, shape);
++    const fp = text.length + ":" + text.slice(0, 300);
++    if (seen.has(fp)) {
++      const rep = `[RTK: duplicate tool result omitted (${text.length}B)]`;
++      stats.bytesBefore += text.length;
++      stats.bytesAfter += rep.length;
++      stats.hits.push({ shape, filter: "cross-dedup", saved: text.length - rep.length });
++      return rep;
++    }
++    seen.add(fp);
++    return compressText(text, stats, shape);
++  };
+   try {
+     const state = body.conversationState;
+     const allMessages = [...(Array.isArray(state?.history) ? state.history : [])];
+@@ -109,7 +137,7 @@ function compressKiroFormat(body, enabled) {
+ 
+         for (const part of tr.content) {
+           if (part && typeof part.text === "string") {
+-            part.text = compressText(part.text, stats, "kiro-tool-result");
++            part.text = compress(part.text, "kiro-tool-result");
+           }
+         }
+       }
+@@ -139,11 +167,11 @@ function compressText(text, stats, shape) {
+   let out = safeApply(fn, text);
+   let filterName = fn.filterName || fn.name;
+   const savedRatio = out && out.length > 0 ? (bytesIn - out.length) / bytesIn : 0;
+-  if (out && out.length > 0 && out.length < bytesIn && bytesIn >= WEAK_COMPRESS_MIN_BYTES && savedRatio < WEAK_COMPRESS_MAX_SAVED_RATIO && fn !== smartTruncate) {
+-    const fallbackOut = safeApply(smartTruncate, text);
++  if (out && out.length > 0 && out.length < bytesIn && bytesIn >= WEAK_COMPRESS_MIN_BYTES && savedRatio < WEAK_COMPRESS_MAX_SAVED_RATIO && fn !== scoredTruncate) {
++    const fallbackOut = safeApply(scoredTruncate, text);
+     if (fallbackOut && fallbackOut.length > 0 && fallbackOut.length < out.length) {
+       out = fallbackOut;
+-      filterName = smartTruncate.filterName || smartTruncate.name;
++      filterName = scoredTruncate.filterName || scoredTruncate.name;
+     }
+   }
+ 

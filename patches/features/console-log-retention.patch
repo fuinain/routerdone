@@ -1,0 +1,443 @@
+diff --git a/src/app/(dashboard)/dashboard/console-log/ConsoleLogClient.js b/src/app/(dashboard)/dashboard/console-log/ConsoleLogClient.js
+index 6373015..0aa44a8 100644
+--- a/src/app/(dashboard)/dashboard/console-log/ConsoleLogClient.js
++++ b/src/app/(dashboard)/dashboard/console-log/ConsoleLogClient.js
+@@ -4,6 +4,14 @@ import { useState, useEffect, useRef } from "react";
+ import { Card, Button } from "@/shared/components";
+ import { CONSOLE_LOG_CONFIG } from "@/shared/constants/config";
+ 
++const RETENTION_OPTIONS = [
++  { value: "900000", label: "15 min" },
++  { value: "3600000", label: "1 hour" },
++  { value: "21600000", label: "6 hours" },
++  { value: "86400000", label: "24 hours" },
++  { value: "0", label: "Off" },
++];
++
+ const LOG_LEVEL_COLORS = {
+   LOG: "text-green-400",
+   INFO: "text-blue-400",
+@@ -22,17 +30,49 @@ function colorLine(line) {
+ export default function ConsoleLogClient() {
+   const [logs, setLogs] = useState([]);
+   const [connected, setConnected] = useState(false);
++  const [retentionMs, setRetentionMs] = useState(String(CONSOLE_LOG_CONFIG.defaultRetentionMs));
++  const [savingRetention, setSavingRetention] = useState(false);
+   const logRef = useRef(null);
+ 
+   const handleClear = async () => {
+     try {
+       await fetch("/api/translator/console-logs", { method: "DELETE" });
+-      // UI cleared via SSE "clear" event
++      // UI syncs via SSE after keeping the last 5 minutes.
+     } catch (err) {
+       console.error("Failed to clear console logs:", err);
+     }
+   };
+ 
++  const handleRetentionChange = async (event) => {
++    const next = event.target.value;
++    setRetentionMs(next);
++    setSavingRetention(true);
++    try {
++      const res = await fetch("/api/settings", {
++        method: "PATCH",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ consoleLogRetentionMs: Number(next) }),
++      });
++      if (!res.ok) throw new Error("Failed to update retention");
++    } catch (err) {
++      console.error("Failed to update console log retention:", err);
++    } finally {
++      setSavingRetention(false);
++    }
++  };
++
++  useEffect(() => {
++    let alive = true;
++    fetch("/api/settings", { cache: "no-store" })
++      .then((res) => res.ok ? res.json() : null)
++      .then((settings) => {
++        if (!alive || !settings) return;
++        setRetentionMs(String(settings.consoleLogRetentionMs ?? CONSOLE_LOG_CONFIG.defaultRetentionMs));
++      })
++      .catch((err) => console.error("Failed to load console log settings:", err));
++    return () => { alive = false; };
++  }, []);
++
+   useEffect(() => {
+     const es = new EventSource("/api/translator/console-logs/stream");
+ 
+@@ -49,6 +89,8 @@ export default function ConsoleLogClient() {
+         });
+       } else if (msg.type === "clear") {
+         setLogs([]);
++      } else if (msg.type === "sync") {
++        setLogs(msg.logs.slice(-CONSOLE_LOG_CONFIG.maxLines));
+       }
+     };
+ 
+@@ -66,9 +108,27 @@ export default function ConsoleLogClient() {
+   return (
+     <div className="">
+       <Card>
+-        <div className="flex items-center justify-end px-4 pt-3 pb-2">
++        <div className="flex flex-wrap items-center justify-end gap-2 px-4 pt-3 pb-2">
++          <label className="flex items-center gap-2 text-xs font-medium text-text-muted">
++            <span className="whitespace-nowrap">Auto-delete</span>
++            <span className="relative inline-flex items-center">
++              <select
++                value={retentionMs}
++                onChange={handleRetentionChange}
++                disabled={savingRetention}
++                className="h-7 w-32 appearance-none rounded-[8px] border border-border bg-surface-2 py-1 pl-3 pr-8 text-xs font-semibold text-text-main outline-none transition-all focus:border-brand-500/50 focus:ring-2 focus:ring-brand-500/20 disabled:opacity-50"
++              >
++                {RETENTION_OPTIONS.map((option) => (
++                  <option key={option.value} value={option.value}>
++                    {option.label}
++                  </option>
++                ))}
++              </select>
++              <span className="material-symbols-outlined pointer-events-none absolute right-2 text-[18px] text-text-muted">expand_more</span>
++            </span>
++          </label>
+           <Button size="sm" variant="outline" icon="delete" onClick={handleClear}>
+-            Clear
++            Clear old
+           </Button>
+         </div>
+         <div
+diff --git a/src/app/api/settings/route.js b/src/app/api/settings/route.js
+index ee2682c..c1a611c 100644
+--- a/src/app/api/settings/route.js
++++ b/src/app/api/settings/route.js
+@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
+ import { getSettings, updateSettings } from "@/lib/localDb";
+ import { applyOutboundProxyEnv } from "@/lib/network/outboundProxy";
+ import { resetComboRotation } from "open-sse/services/combo.js";
++import { setConsoleLogRetentionMs } from "@/lib/consoleLogBuffer";
+ import bcrypt from "bcryptjs";
+ 
+ export const dynamic = "force-dynamic";
+@@ -17,8 +18,7 @@ const PROTECTED_SETTING_KEYS = ["password", "mitmSudoEncrypted"];
+ export async function GET() {
+   try {
+     const settings = await getSettings();
+-    const { password, oidcClientSecret, ...safeSettings } = settings;
+-    safeSettings.oidcConfigured = !!(safeSettings.oidcIssuerUrl && safeSettings.oidcClientId && oidcClientSecret);
++    const { password, ...safeSettings } = settings;
+     
+     const enableRequestLogs = process.env.ENABLE_REQUEST_LOGS === "true";
+     const enableTranslator = process.env.ENABLE_TRANSLATOR === "true";
+@@ -42,6 +42,14 @@ export async function PATCH(request) {
+     // Strip protected secrets before any internal handling sets them
+     for (const key of PROTECTED_SETTING_KEYS) delete body[key];
+ 
++    if (Object.prototype.hasOwnProperty.call(body, "consoleLogRetentionMs")) {
++      const value = Number(body.consoleLogRetentionMs);
++      if (!Number.isFinite(value) || value < 0 || value > 24 * 60 * 60 * 1000) {
++        return NextResponse.json({ error: "Invalid console log retention" }, { status: 400 });
++      }
++      body.consoleLogRetentionMs = value;
++    }
++
+     // If updating password, hash it
+     if (body.newPassword) {
+       const settings = await getSettings();
+@@ -70,12 +78,6 @@ export async function PATCH(request) {
+       delete body.currentPassword;
+     }
+ 
+-    if (Object.prototype.hasOwnProperty.call(body, "oidcClientSecret")) {
+-      if (!body.oidcClientSecret || !String(body.oidcClientSecret).trim()) {
+-        delete body.oidcClientSecret;
+-      }
+-    }
+-
+     const settings = await updateSettings(body);
+ 
+     // Apply outbound proxy settings immediately (no restart required)
+@@ -96,8 +98,11 @@ export async function PATCH(request) {
+       resetComboRotation();
+     }
+ 
+-    const { password, oidcClientSecret, ...safeSettings } = settings;
+-    safeSettings.oidcConfigured = !!(safeSettings.oidcIssuerUrl && safeSettings.oidcClientId && oidcClientSecret);
++    if (Object.prototype.hasOwnProperty.call(body, "consoleLogRetentionMs")) {
++      setConsoleLogRetentionMs(settings.consoleLogRetentionMs);
++    }
++
++    const { password, ...safeSettings } = settings;
+     return NextResponse.json(safeSettings, { headers: SETTINGS_RESPONSE_HEADERS });
+   } catch (error) {
+     console.log("Error updating settings:", error);
+diff --git a/src/app/api/translator/console-logs/route.js b/src/app/api/translator/console-logs/route.js
+index 43d3e59..f5b9546 100644
+--- a/src/app/api/translator/console-logs/route.js
++++ b/src/app/api/translator/console-logs/route.js
+@@ -1,10 +1,17 @@
+ import { NextResponse } from "next/server";
+-import { clearConsoleLogs, getConsoleLogs, initConsoleLogCapture } from "@/lib/consoleLogBuffer";
++import { clearConsoleLogs, getConsoleLogs, initConsoleLogCapture, setConsoleLogRetentionMs } from "@/lib/consoleLogBuffer";
++import { getSettings } from "@/lib/localDb";
+ 
+ initConsoleLogCapture();
+ 
++async function applyRetentionSetting() {
++  const settings = await getSettings();
++  setConsoleLogRetentionMs(settings.consoleLogRetentionMs);
++}
++
+ export async function GET() {
+   try {
++    await applyRetentionSetting();
+     const logs = getConsoleLogs();
+     return NextResponse.json({ success: true, logs });
+   } catch (error) {
+@@ -15,6 +22,7 @@ export async function GET() {
+ 
+ export async function DELETE() {
+   try {
++    await applyRetentionSetting();
+     clearConsoleLogs();
+     return NextResponse.json({ success: true });
+   } catch (error) {
+diff --git a/src/app/api/translator/console-logs/stream/route.js b/src/app/api/translator/console-logs/stream/route.js
+index e90f11f..e0467b9 100644
+--- a/src/app/api/translator/console-logs/stream/route.js
++++ b/src/app/api/translator/console-logs/stream/route.js
+@@ -1,13 +1,17 @@
+-import { getConsoleLogs, getConsoleEmitter, initConsoleLogCapture } from "@/lib/consoleLogBuffer";
++import { getConsoleLogs, getConsoleEmitter, initConsoleLogCapture, setConsoleLogRetentionMs } from "@/lib/consoleLogBuffer";
++import { getSettings } from "@/lib/localDb";
+ 
+ export const dynamic = "force-dynamic";
+ 
+ initConsoleLogCapture();
+ 
+ export async function GET(request) {
++  const settings = await getSettings();
++  setConsoleLogRetentionMs(settings.consoleLogRetentionMs);
++
+   const encoder = new TextEncoder();
+   const emitter = getConsoleEmitter();
+-  const state = { closed: false, send: null, sendClear: null, keepalive: null };
++  const state = { closed: false, send: null, sendClear: null, sendPrune: null, keepalive: null };
+ 
+   // Idempotent: safe to call from request.signal abort, cancel(), or enqueue failure.
+   const cleanup = () => {
+@@ -15,6 +19,7 @@ export async function GET(request) {
+     state.closed = true;
+     if (state.send) emitter.off("line", state.send);
+     if (state.sendClear) emitter.off("clear", state.sendClear);
++    if (state.sendPrune) emitter.off("prune", state.sendPrune);
+     if (state.keepalive) clearInterval(state.keepalive);
+   };
+ 
+@@ -50,8 +55,18 @@ export async function GET(request) {
+         }
+       };
+ 
++      state.sendPrune = (logs) => {
++        if (state.closed) return;
++        try {
++          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "sync", logs })}\n\n`));
++        } catch {
++          cleanup();
++        }
++      };
++
+       emitter.on("line", state.send);
+       emitter.on("clear", state.sendClear);
++      emitter.on("prune", state.sendPrune);
+ 
+       // Keepalive ping every 25s
+       state.keepalive = setInterval(() => {
+diff --git a/src/lib/consoleLogBuffer.js b/src/lib/consoleLogBuffer.js
+index afff411..defab09 100644
+--- a/src/lib/consoleLogBuffer.js
++++ b/src/lib/consoleLogBuffer.js
+@@ -2,6 +2,7 @@ import { EventEmitter } from "events";
+ import { CONSOLE_LOG_CONFIG } from "@/shared/constants/config.js";
+ 
+ const consoleLevels = ["log", "info", "warn", "error", "debug"];
++const DEFAULT_RETENTION_MS = CONSOLE_LOG_CONFIG.defaultRetentionMs;
+ 
+ if (!global._consoleLogBufferState) {
+   global._consoleLogBufferState = {
+@@ -9,6 +10,8 @@ if (!global._consoleLogBufferState) {
+     patched: false,
+     originals: {},
+     emitter: new EventEmitter(),
++    retentionMs: DEFAULT_RETENTION_MS,
++    pruneTimer: null,
+   };
+   global._consoleLogBufferState.emitter.setMaxListeners(50);
+ }
+@@ -20,6 +23,14 @@ if (!state.emitter) {
+   state.emitter = new EventEmitter();
+   state.emitter.setMaxListeners(50);
+ }
++if (state.retentionMs === undefined) state.retentionMs = DEFAULT_RETENTION_MS;
++
++function normalizeLogEntries() {
++  const now = Date.now();
++  state.logs = state.logs.map((entry) => typeof entry === "string" ? { line: entry, createdAt: now } : entry);
++}
++
++normalizeLogEntries();
+ 
+ function toLogLine(level, args) {
+   return args.map(formatArg).join(" ");
+@@ -43,7 +54,8 @@ function formatArg(arg) {
+ }
+ 
+ function appendLine(line) {
+-  state.logs.push(line);
++  pruneExpiredLogs(false);
++  state.logs.push({ line, createdAt: Date.now() });
+   const maxLines = CONSOLE_LOG_CONFIG.maxLines;
+   if (state.logs.length > maxLines) {
+     state.logs = state.logs.slice(-maxLines);
+@@ -51,7 +63,35 @@ function appendLine(line) {
+   state.emitter.emit("line", line);
+ }
+ 
++function getLogLines() {
++  return state.logs.map((entry) => entry.line);
++}
++
++function pruneExpiredLogs(emit = true) {
++  const retentionMs = Number(state.retentionMs) || 0;
++  if (retentionMs <= 0) return 0;
++
++  const cutoff = Date.now() - retentionMs;
++  const before = state.logs.length;
++  state.logs = state.logs.filter((entry) => {
++    return entry.createdAt >= cutoff;
++  });
++
++  const removed = before - state.logs.length;
++  if (removed > 0 && emit) {
++    state.emitter.emit("prune", getLogLines());
++  }
++  return removed;
++}
++
++function ensurePruneTimer() {
++  if (state.pruneTimer) return;
++  state.pruneTimer = setInterval(() => pruneExpiredLogs(true), CONSOLE_LOG_CONFIG.pruneIntervalMs);
++  if (typeof state.pruneTimer.unref === "function") state.pruneTimer.unref();
++}
++
+ export function initConsoleLogCapture() {
++  ensurePruneTimer();
+   if (state.patched) return;
+ 
+   for (const level of consoleLevels) {
+@@ -66,12 +106,25 @@ export function initConsoleLogCapture() {
+ }
+ 
+ export function getConsoleLogs() {
+-  return state.logs;
++  pruneExpiredLogs(false);
++  return getLogLines();
+ }
+ 
+ export function clearConsoleLogs() {
+-  state.logs = [];
+-  state.emitter.emit("clear");
++  const cutoff = Date.now() - CONSOLE_LOG_CONFIG.clearPreserveMs;
++  state.logs = state.logs.filter((entry) => typeof entry !== "string" && entry.createdAt >= cutoff);
++  if (state.logs.length > 0) {
++    state.emitter.emit("prune", getLogLines());
++  } else {
++    state.emitter.emit("clear");
++  }
++}
++
++export function setConsoleLogRetentionMs(retentionMs) {
++  const next = Math.max(0, Number(retentionMs) || 0);
++  state.retentionMs = next;
++  ensurePruneTimer();
++  pruneExpiredLogs(true);
+ }
+ 
+ export function getConsoleEmitter() {
+diff --git a/src/lib/db/repos/settingsRepo.js b/src/lib/db/repos/settingsRepo.js
+index 0057cc1..eb4c390 100644
+--- a/src/lib/db/repos/settingsRepo.js
++++ b/src/lib/db/repos/settingsRepo.js
+@@ -18,12 +18,6 @@ const DEFAULT_SETTINGS = {
+   comboStrategies: {},
+   requireLogin: true,
+   tunnelDashboardAccess: true,
+-  authMode: "password",
+-  oidcIssuerUrl: "",
+-  oidcClientId: "",
+-  oidcClientSecret: "",
+-  oidcScopes: "openid profile email",
+-  oidcLoginLabel: "Sign in with OIDC",
+   enableObservability: true,
+   observabilityMaxRecords: 1000,
+   observabilityBatchSize: 20,
+@@ -42,6 +36,7 @@ const DEFAULT_SETTINGS = {
+   cavemanLevel: "full",
+   ponytailEnabled: false,
+   ponytailLevel: "full",
++  consoleLogRetentionMs: 60 * 60 * 1000,
+ };
+ 
+ async function readRaw() {
+diff --git a/src/shared/constants/config.js b/src/shared/constants/config.js
+--- a/src/shared/constants/config.js
++++ b/src/shared/constants/config.js
+@@ -11,7 +11,6 @@ export const APP_CONFIG = {
+ // GitHub configuration
+ export const GITHUB_CONFIG = {
+   changelogUrl: "https://raw.githubusercontent.com/decolua/9router/refs/heads/master/CHANGELOG.md",
+-  donateUrl: "https://9router.com/api/donate",
+ };
+ 
+ // Updater configuration
+@@ -58,18 +57,40 @@ export const API_ENDPOINTS = {
++  defaultRetentionMs: 60 * 60 * 1000,
++  clearPreserveMs: 5 * 60 * 1000,
++  pruneIntervalMs: 60 * 60 * 1000,
+ };
+ 
+ // Client-side store TTL: how long fetched data stays fresh before re-fetching
+ export const CLIENT_STORE_TTL_MS = 60000;
+ 
+ // Claude auto-ping: keep 5h window warm by sending a tiny request right after reset
+ export const CLAUDE_AUTOPING_CONFIG = {
+   settingsKey: "claudeAutoPing",        // settings table field
+   tickIntervalMs: 60000,                // scheduler tick
+   pingLeadMs: 5000,                     // fire once reset passes (within tolerance)
+   pingModel: "claude-haiku-4-5-20251001", // cheapest model
+   pingText: "hi",
+   pingMaxTokens: 1,
+   refreshAheadMs: 300000,               // refetch usage when within 5min of reset
+   fiveHourKey: "session (5h)",          // quota key returned by usage handler
+ };
++
++// Provider API endpoints (for display only)
++export const PROVIDER_ENDPOINTS = {
++  openrouter: "https://openrouter.ai/api/v1/chat/completions",
++  glm: "https://api.z.ai/api/anthropic/v1/messages",
++  "glm-cn": "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
++  kimi: "https://api.kimi.com/coding/v1/messages",
++  minimax: "https://api.minimax.io/anthropic/v1/messages",
++  "minimax-cn": "https://api.minimaxi.com/anthropic/v1/messages",
++  alicode: "https://coding.dashscope.aliyuncs.com/v1/chat/completions",
++  "alicode-intl": "https://coding-intl.dashscope.aliyuncs.com/v1/chat/completions",
++  "volcengine-ark": "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions",
++  byteplus: "https://ark.ap-southeast.bytepluses.com/api/coding/v3/chat/completions",
++  openai: "https://api.openai.com/v1/chat/completions",
++  anthropic: "https://api.anthropic.com/v1/messages",
++  gemini: "https://generativelanguage.googleapis.com/v1beta/models",
++  ollama: "https://ollama.com/api/chat",
++  "ollama-local": "http://localhost:11434/api/chat",
++};
+ 
+ // Re-export from providers.js for backward compatibility

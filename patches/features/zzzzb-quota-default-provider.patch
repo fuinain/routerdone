@@ -1,0 +1,89 @@
+diff --git a/src/app/(dashboard)/dashboard/usage/components/ProviderLimits/index.js b/src/app/(dashboard)/dashboard/usage/components/ProviderLimits/index.js
+--- a/src/app/(dashboard)/dashboard/usage/components/ProviderLimits/index.js
++++ b/src/app/(dashboard)/dashboard/usage/components/ProviderLimits/index.js
+@@ -94,6 +94,7 @@
+   (conn.authType === "oauth" || USAGE_APIKEY_PROVIDERS.includes(conn.provider));
+ 
+ const AUTO_MANAGE_STORAGE_KEY = "quotaAutoManage";
++const DEFAULT_PROVIDER_FILTER_KEY = "quotaDefaultProviderFilter";
+ export default function ProviderLimits() {
+   const { copied, copy } = useCopyToClipboard();
+   const [connections, setConnections] = useState([]);
+@@ -120,7 +121,14 @@
+   const [showEditModal, setShowEditModal] = useState(false);
+   const [selectedConnection, setSelectedConnection] = useState(null);
+   const [proxyPools, setProxyPools] = useState([]);
+-  const [providerFilter, setProviderFilter] = useState("all");
++  const [providerFilter, setProviderFilter] = useState(() => {
++    if (typeof window === "undefined") return "all";
++    return window.localStorage.getItem(DEFAULT_PROVIDER_FILTER_KEY) || "all";
++  });
++  const [defaultProviderFilter, setDefaultProviderFilter] = useState(() => {
++    if (typeof window === "undefined") return null;
++    return window.localStorage.getItem(DEFAULT_PROVIDER_FILTER_KEY);
++  });
+   const [providerOptions, setProviderOptions] = useState([]);
+   const [accountFilter, setAccountFilter] = useState("all");
+   const [quotaSortMode, setQuotaSortMode] = useState("default");
+@@ -661,6 +669,14 @@
+     },
+     [bulkToggling],
+   );
++
++  const handleSetDefaultProvider = useCallback(() => {
++    if (typeof window === "undefined") return;
++    window.localStorage.setItem(DEFAULT_PROVIDER_FILTER_KEY, providerFilter);
++    setDefaultProviderFilter(providerFilter);
++    setProviderMenuOpen(false);
++  }, [providerFilter]);
++
+   const handleDisableDepleted = () => {
+     const ids = sortedConnections
+       .filter((c) => (c.isActive ?? true) && isConnectionDepleted(c))
+@@ -760,6 +776,18 @@
+       Object.values(timers).forEach(clearTimeout);
+     };
+   }, []);
++
++  // Validate saved default provider filter still has eligible connections;
++  // reset to "all" if the pinned provider disappeared (e.g. disconnected).
++  useEffect(() => {
++    if (connectionsLoading || providerFilter === "all") return;
++    const hasProvider = connections.some(
++      (c) => isUsageEligible(c) && c.provider === providerFilter,
++    );
++    if (!hasProvider && connections.some(isUsageEligible)) {
++      setProviderFilter("all");
++    }
++  }, [connectionsLoading, providerFilter, connections]);
+ 
+   const selectedProviderLabel =
+     providerFilter === "all" ? "All providers" : providerFilter;
+@@ -911,6 +939,27 @@
+                       </button>
+                     ))}
+                   </div>
++                  {/* Set as default provider view */}
++                  <div className="my-1 h-px bg-black/10 dark:bg-white/10" />
++                  <button
++                    type="button"
++                    onClick={handleSetDefaultProvider}
++                    className={`flex w-full items-center gap-2 rounded-xl px-3 py-2 text-xs transition-colors ${
++                      defaultProviderFilter === providerFilter
++                        ? "text-primary"
++                        : "text-text-muted hover:bg-black/5 dark:hover:bg-white/10"
++                    }`}
++                    title="Remember current provider view for next visits"
++                  >
++                    <span className="material-symbols-outlined text-[16px]">
++                      {defaultProviderFilter === providerFilter ? "check_circle" : "push_pin"}
++                    </span>
++                    <span>
++                      {defaultProviderFilter === providerFilter
++                        ? "Default view"
++                        : "Set as default view"}
++                    </span>
++                  </button>
+                 </div>
+               </>
+             )}

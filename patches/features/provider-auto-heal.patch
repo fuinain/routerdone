@@ -1,0 +1,154 @@
+--- a/open-sse/services/accountFallback.js
++++ b/open-sse/services/accountFallback.js
+@@ -213,3 +213,57 @@
+     status: "error"
+   };
+ }
++
++/**
++ * Detect and build a cleanup update for a connection whose error state is stale:
++ * testStatus is "unavailable"/"error" (or lastError set) but all modelLock_* keys
++ * have expired. Returns { needsUpdate, update } where update is the DB patch.
++ * Does NOT persist; caller decides whether to write. When some locks are still
++ * active, only expired lock keys are cleaned (partial=true) without resetting
++ * error display state.
++ */
++export function normalizeStaleConnectionState(connection) {
++  if (!connection) return { needsUpdate: false, update: {} };
++  const hasErrorState =
++    connection.testStatus === "unavailable" ||
++    connection.testStatus === "error" ||
++    !!connection.lastError;
++  if (!hasErrorState) return { needsUpdate: false, update: {} };
++
++  const now = Date.now();
++  const lockEntries = Object.entries(connection).filter(
++    ([k]) => k.startsWith(MODEL_LOCK_PREFIX) || k === MODEL_LOCK_ALL,
++  );
++  const expiredLockKeys = [];
++  let hasActiveLock = false;
++
++  for (const [key, val] of lockEntries) {
++    if (!val) continue;
++    if (new Date(val).getTime() > now) {
++      hasActiveLock = true;
++    } else {
++      expiredLockKeys.push(key);
++    }
++  }
++
++  // Clean expired lock keys even while other locks are still active,
++  // but do not reset testStatus/lastError until no active locks remain.
++  if (hasActiveLock) {
++    if (expiredLockKeys.length === 0) return { needsUpdate: false, update: {} };
++    const update = {};
++    for (const k of expiredLockKeys) update[k] = null;
++    return { needsUpdate: true, update, partial: true };
++  }
++
++  // No active locks: full auto-heal
++  const update = {};
++  for (const k of expiredLockKeys) update[k] = null;
++  if (connection.testStatus === "unavailable" || connection.testStatus === "error") {
++    update.testStatus = "active";
++  }
++  if (connection.lastError) update.lastError = null;
++  if (connection.lastErrorAt) update.lastErrorAt = null;
++  if (connection.errorCode) update.errorCode = null;
++  if (connection.backoffLevel) update.backoffLevel = 0;
++  return { needsUpdate: Object.keys(update).length > 0, update };
++}
+--- a/src/app/(dashboard)/dashboard/providers/[id]/ConnectionRow.js
++++ b/src/app/(dashboard)/dashboard/providers/[id]/ConnectionRow.js
+@@ -144,7 +144,7 @@
+               </Badge>
+             )}
+             {isCooldown && connection.isActive !== false && <CooldownTimer until={modelLockUntil} />}
+-            {connection.lastError && connection.isActive !== false && (
++            {connection.lastError && connection.isActive !== false && (isCooldown || effectiveStatus === "error" || effectiveStatus === "expired") && (
+               <span className="max-w-full truncate text-xs text-red-500 sm:max-w-[300px]" title={connection.lastError}>
+                 {connection.lastError}
+               </span>
+--- a/src/app/(dashboard)/dashboard/providers/[id]/page.js
++++ b/src/app/(dashboard)/dashboard/providers/[id]/page.js
+@@ -412,7 +412,11 @@
+         body: JSON.stringify({ isActive }),
+       });
+       if (res.ok) {
+-        setConnections(prev => prev.map(c => c.id === id ? { ...c, isActive } : c));
++        setConnections(prev => prev.map(c => c.id === id ? {
++          ...c,
++          isActive,
++          ...(isActive ? { testStatus: "active", lastError: null, lastErrorAt: null } : {}),
++        } : c));
+       }
+     } catch (error) {
+       console.log("Error updating connection status:", error);
+--- a/src/app/(dashboard)/dashboard/providers/components/ConnectionsCard.js
++++ b/src/app/(dashboard)/dashboard/providers/components/ConnectionsCard.js
+@@ -123,7 +123,7 @@
+             </Badge>
+             {hasAnyProxy && <Badge variant={proxyBadgeVariant} size="sm">Proxy</Badge>}
+             {isCooldown && connection.isActive !== false && <CooldownTimer until={modelLockUntil} />}
+-            {connection.lastError && connection.isActive !== false && (
++            {connection.lastError && connection.isActive !== false && (isCooldown || effectiveStatus === "error" || effectiveStatus === "expired") && (
+               <span className="text-xs text-red-500 truncate max-w-[300px]" title={connection.lastError}>{connection.lastError}</span>
+             )}
+             <span className="text-xs text-text-muted">#{connection.priority}</span>
+@@ -368,7 +368,7 @@
+   const handleToggleActive = async (id, isActive) => {
+     try {
+       const res = await fetch(`/api/providers/${id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isActive }) });
+-      if (res.ok) setConnections((prev) => prev.map((c) => c.id === id ? { ...c, isActive } : c));
++      if (res.ok) setConnections((prev) => prev.map((c) => c.id === id ? { ...c, isActive, ...(isActive ? { testStatus: "active", lastError: null, lastErrorAt: null } : {}) } : c));
+     } catch (e) { console.log("toggle error:", e); }
+   };
+ 
+--- a/src/app/api/providers/[id]/route.js
++++ b/src/app/api/providers/[id]/route.js
+@@ -5,6 +5,7 @@
+   updateProviderConnection,
+   deleteProviderConnection,
+ } from "@/models";
++import { normalizeStaleConnectionState } from "open-sse/services/accountFallback.js";
+ 
+ function normalizeProxyConfig(body = {}) {
+   const hasAnyProxyField =
+@@ -69,8 +70,15 @@
+       return NextResponse.json({ error: "Connection not found" }, { status: 404 });
+     }
+ 
++    // Lazy auto-heal: clear stale unavailable state when all model locks expired.
++    let effective = connection;
++    const stale = normalizeStaleConnectionState(connection);
++    if (stale.needsUpdate) {
++      effective = await updateProviderConnection(id, stale.update) || connection;
++    }
++
+     // Hide sensitive fields
+-    const result = { ...connection };
++    const result = { ...effective };
+     delete result.apiKey;
+     delete result.accessToken;
+     delete result.refreshToken;
+@@ -126,6 +134,9 @@
+     if (testStatus !== undefined) updateData.testStatus = testStatus;
+     if (lastError !== undefined) updateData.lastError = lastError;
+     if (lastErrorAt !== undefined) updateData.lastErrorAt = lastErrorAt;
++    if (isActive === true) {
++      Object.assign(updateData, normalizeStaleConnectionState(existing).update);
++    }
+ 
+     if (
+       shouldMergeProviderSpecificData(
+--- a/src/app/api/providers/route.js
++++ b/src/app/api/providers/route.js
+@@ -49,7 +49,7 @@
+ // GET /api/providers - List all connections
+ export async function GET() {
+   try {
+-    const connections = await getProviderConnections();
++    const connections = await getProviderConnections();
+ 
+     // Build nodeNameMap for compatible providers (id → name)
+     let nodeNameMap = {};
