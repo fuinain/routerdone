@@ -616,11 +616,28 @@ export default function ProviderLimits() {
     return err.includes("payment required") || err.includes("billing_error");
   };
 
+  // A connection is quota-API blocked when the upstream quota API returned an
+  // auth/forbidden state (e.g. Antigravity "quota API authentication expired"
+  // or "quota API access forbidden"). The chat path may still work, but we
+  // cannot trust quota numbers, so auto-manage must keep it disabled instead of
+  // re-enabling it on stale/positive-looking data.
+  const isConnectionQuotaBlocked = (conn) => {
+    const msg = String(quotaData[conn.id]?.message || "").toLowerCase();
+    if (!msg) return false;
+    return (
+      msg.includes("quota api authentication expired") ||
+      msg.includes("quota api access forbidden") ||
+      msg.includes("authentication expired") ||
+      msg.includes("access forbidden")
+    );
+  };
+
   // Connection is fully available only when ALL quota types are above threshold.
   // AND condition: session AND weekly must both be positive; one depleted -> stays disabled.
   // A 402 payment-blocked connection is never "fully available" regardless of quota.
   const isConnectionFullyAvailable = (conn) => {
     if (isConnectionPaymentBlocked(conn)) return false;
+    if (isConnectionQuotaBlocked(conn)) return false;
     const quotas = quotaData[conn.id]?.quotas;
     if (!quotas?.length) return false;
     return quotas.every((q) => {
@@ -722,7 +739,7 @@ export default function ProviderLimits() {
 
     const toggles = [
       ...conns
-        .filter((c) => (c.isActive ?? true) && (isConnectionDepleted(c) || isConnectionPaymentBlocked(c)))
+        .filter((c) => (c.isActive ?? true) && (isConnectionDepleted(c) || isConnectionPaymentBlocked(c) || isConnectionQuotaBlocked(c)))
         .map((c) => ({ id: c.id, isActive: false })),
       ...conns
         .filter((c) => !(c.isActive ?? true) && isConnectionFullyAvailable(c))
@@ -733,7 +750,7 @@ export default function ProviderLimits() {
       const disabled = toggles.filter((t) => !t.isActive).length;
       const enabled = toggles.filter((t) => t.isActive).length;
       const notices = [];
-      if (disabled > 0) notices.push(`Auto-disabled ${disabled} account(s) (depleted or payment error)`);
+      if (disabled > 0) notices.push(`Auto-disabled ${disabled} account(s) (depleted, payment, or quota API error)`);
       if (enabled > 0) notices.push(`Auto-enabled ${enabled} account(s) with available quota`);
       setAutoManageNotice(notices.join(" - "));
       bulkToggleMixed(toggles);
