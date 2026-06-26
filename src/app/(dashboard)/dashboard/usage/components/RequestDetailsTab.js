@@ -88,6 +88,12 @@ function getInputTokens(tokens) {
   return prompt < cache ? cache : prompt;
 }
 
+function maskApiKey(key) {
+  if (!key) return "-";
+  if (key.length <= 12) return key;
+  return `${key.slice(0, 8)}...${key.slice(-4)}`;
+}
+
 export default function RequestDetailsTab() {
   const [details, setDetails] = useState([]);
   const [pagination, setPagination] = useState({
@@ -103,6 +109,7 @@ export default function RequestDetailsTab() {
   const [providerNameCache, setProviderNameCache] = useState(null);
   const [filters, setFilters] = useState({
     provider: "",
+    apiKey: "",
     startDate: "",
     endDate: ""
   });
@@ -128,6 +135,7 @@ export default function RequestDetailsTab() {
         pageSize: pagination.pageSize.toString()
       });
       if (filters.provider) params.append("provider", filters.provider);
+      if (filters.apiKey) params.append("apiKey", filters.apiKey);
       if (filters.startDate) params.append("startDate", filters.startDate);
       if (filters.endDate) params.append("endDate", filters.endDate);
 
@@ -165,13 +173,13 @@ export default function RequestDetailsTab() {
   };
 
   const handleClearFilters = () => {
-    setFilters({ provider: "", startDate: "", endDate: "" });
+    setFilters({ provider: "", apiKey: "", startDate: "", endDate: "" });
   };
 
   return (
     <div className="flex min-w-0 flex-col gap-6">
       <Card padding="md">
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-5">
           <div className="flex min-w-0 flex-col gap-2">
             <label htmlFor="provider-filter" className="text-sm font-medium text-text-main">Provider</label>
             <select
@@ -192,6 +200,21 @@ export default function RequestDetailsTab() {
                 </option>
               ))}
             </select>
+          </div>
+
+          <div className="flex min-w-0 flex-col gap-2">
+            <label htmlFor="api-key-filter" className="text-sm font-medium text-text-main">API Key</label>
+            <input
+              id="api-key-filter"
+              type="text"
+              value={filters.apiKey}
+              onChange={(e) => setFilters({ ...filters, apiKey: e.target.value })}
+              placeholder="sk-..."
+              className={cn(
+                "h-9 px-3 rounded-lg border border-black/10 dark:border-white/10 bg-surface",
+                "w-full min-w-0 font-mono text-sm text-text-main focus:outline-none focus:ring-2 focus:ring-primary/20"
+              )}
+            />
           </div>
           
           <div className="flex min-w-0 flex-col gap-2">
@@ -227,7 +250,7 @@ export default function RequestDetailsTab() {
             <Button 
               variant="ghost" 
               onClick={handleClearFilters}
-              disabled={!filters.provider && !filters.startDate && !filters.endDate}
+              disabled={!filters.provider && !filters.apiKey && !filters.startDate && !filters.endDate}
               className="w-full"
             >
               Clear Filters
@@ -348,6 +371,10 @@ export default function RequestDetailsTab() {
               <div>
                 <span className="text-text-muted">Model:</span>{" "}
                 <span className="text-text-main font-mono">{selectedDetail.model}</span>
+              </div>
+              <div>
+                <span className="text-text-muted">API Key:</span>{" "}
+                <span className="break-all font-mono text-text-main">{maskApiKey(selectedDetail.apiKey)}</span>
               </div>
               <div>
                 <span className="text-text-muted">Status:</span>{" "}

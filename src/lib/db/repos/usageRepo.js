@@ -97,6 +97,7 @@ function normalizeRecentRequest(entry) {
     timestamp: entry.timestamp,
     model: entry.model,
     provider: entry.provider || "",
+    apiKey: entry.apiKey || null,
     displayModel: actualModel || entry.model || requestedModel || comboName || "unknown",
     requestedModel,
     comboName,
@@ -392,13 +393,14 @@ export async function getUsageStats(period = "all") {
   for (const k of allApiKeys) apiKeyMap[k.key] = { name: k.name, id: k.id, createdAt: k.createdAt };
 
   // recentRequests from live history (last 100 entries enough for 20 deduped)
-  const recentRows = db.all(`SELECT timestamp, provider, model, tokens, status, meta FROM usageHistory ORDER BY id DESC LIMIT 100`);
+  const recentRows = db.all(`SELECT timestamp, provider, model, apiKey, tokens, status, meta FROM usageHistory ORDER BY id DESC LIMIT 100`);
   const seen = new Set();
   const recentRequests = collapseRecentRequests(recentRows
     .map((r) => normalizeRecentRequest({
       timestamp: r.timestamp,
       model: r.model,
       provider: r.provider,
+      apiKey: r.apiKey,
       tokens: parseJson(r.tokens, {}) || {},
       status: r.status,
       meta: parseJson(r.meta, {}) || {},

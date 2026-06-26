@@ -90,6 +90,7 @@ async function flushToDatabase() {
             provider: item.provider || null,
             model: item.model || null,
             connectionId: item.connectionId || null,
+            apiKey: item.apiKey || null,
             timestamp: item.timestamp,
             status: item.status || null,
             latency: item.latency || {},
@@ -153,20 +154,20 @@ export async function getRequestDetails(filter = {}) {
   if (filter.startDate) { conds.push("timestamp >= ?"); params.push(new Date(filter.startDate).toISOString()); }
   if (filter.endDate) { conds.push("timestamp <= ?"); params.push(new Date(filter.endDate).toISOString()); }
 
-  const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
-  const cntRow = db.get(`SELECT COUNT(*) as c FROM requestDetails ${where}`, params);
-  const totalItems = cntRow ? cntRow.c : 0;
-
   const page = filter.page || 1;
   const pageSize = filter.pageSize || 50;
-  const totalPages = Math.ceil(totalItems / pageSize);
   const offset = (page - 1) * pageSize;
+  const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+  const rows = db.all(`SELECT data FROM requestDetails ${where} ORDER BY timestamp DESC`, params);
+  let details = rows.map((r) => parseJson(r.data, {}));
 
-  const rows = db.all(
-    `SELECT data FROM requestDetails ${where} ORDER BY timestamp DESC LIMIT ? OFFSET ?`,
-    [...params, pageSize, offset]
-  );
-  const details = rows.map((r) => parseJson(r.data, {}));
+  if (filter.apiKey) {
+    details = details.filter((detail) => detail.apiKey === filter.apiKey);
+  }
+
+  const totalItems = details.length;
+  const totalPages = Math.ceil(totalItems / pageSize);
+  details = details.slice(offset, offset + pageSize);
 
   return {
     details,
