@@ -57,7 +57,7 @@ const RECENT_REQUEST_LIMIT = 20;
 function RecentRequests({ requests = [] }) {
   const [, setTick] = useState(0);
   const scrollRef = useRef(null);
-  const shouldTailScroll = useRef(true);
+  const shouldHeadScroll = useRef(true);
 
   // Single timer for the whole list instead of one per row
   useEffect(() => {
@@ -66,19 +66,19 @@ function RecentRequests({ requests = [] }) {
     return () => clearInterval(timer);
   }, [requests.length]);
 
-  const capped = useMemo(() => requests.slice(0, RECENT_REQUEST_LIMIT).reverse(), [requests]);
+  const capped = useMemo(() => requests.slice(0, RECENT_REQUEST_LIMIT), [requests]);
   const scrollKey = capped.map((r) => [r.timestamp, r.model, r.displayModel, r.actualProvider, r.actualModel, r.promptTokens, r.completionTokens, r.status].join(":")).join("|");
 
-  // Tail the live feed while the user is already at the newest rows.
+  // Keep newest rows visible while the user is already at the head.
   useEffect(() => {
     const el = scrollRef.current;
-    if (!el || !shouldTailScroll.current) return;
-    el.scrollTop = el.scrollHeight;
+    if (!el || !shouldHeadScroll.current) return;
+    el.scrollTop = 0;
   }, [scrollKey]);
 
   const handleScroll = useCallback((event) => {
     const el = event.currentTarget;
-    shouldTailScroll.current = el.scrollHeight - el.scrollTop - el.clientHeight <= 48;
+    shouldHeadScroll.current = el.scrollTop <= 48;
   }, []);
 
   return (
