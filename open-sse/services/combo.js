@@ -7,6 +7,7 @@ import { parseResetAfterText, parseRetryAfterHeader, unavailableResponse } from 
 import { isImmediateFallbackStatus, isRetryableTransientStatus, resolveRoutePolicy } from "./routePolicy.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { extractTextContent } from "../translator/formats/gemini.js";
+import { MODEL_FAILURE_BACKOFF_MAX_MS } from "../config/errorConfig.js";
 
 // Hard capabilities = input modalities; missing one drops request data (e.g. image
 // stripped). Must be prioritized. Soft (e.g. search) only degrades a feature.
@@ -16,6 +17,7 @@ const HARD_CAPS = new Set(["vision", "pdf", "audioInput", "videoInput"]);
 const TOOL_CALL_PREFIX = "[Called tools: ";
 const TOOL_RESULT_PREFIX = "[Tool result: ";
 const comboModelCooldowns = new Map();
+const comboModelFailures = new Map();
 const DEFAULT_COMBO_MODEL_COOLDOWN_MS = 30_000;
 const CONSOLE_TIME_ZONE = "Asia/Ho_Chi_Minh";
 const consoleTimeFormatter = new Intl.DateTimeFormat("sv-SE", {
@@ -50,12 +52,27 @@ function getComboCooldownUntil(modelStr) {
   return comboModelCooldowns.get(modelStr) || 0;
 }
 
+// Per-model consecutive-failure counter drives an exponential backoff so a
+// chronically dead model is not re-probed every base window. Cooldown =
+// base * 2^(n-1), capped at MODEL_FAILURE_BACKOFF_MAX_MS. The counter persists
+// across cooldown expiry and is only cleared by a successful (2xx) call to that
+// model, so repeated failures keep escalating until the model recovers.
 function markComboCooldown(modelStr) {
-  const cooldownMs = resolveComboModelCooldownMs();
-  if (cooldownMs <= 0) return 0;
-  const until = Date.now() + cooldownMs;
+  const baseMs = resolveComboModelCooldownMs();
+  if (baseMs <= 0) return 0;
+  const nextCount = (comboModelFailures.get(modelStr) || 0) + 1;
+  comboModelFailures.set(modelStr, nextCount);
+  const backoffMs = Math.min(baseMs * Math.pow(2, nextCount - 1), MODEL_FAILURE_BACKOFF_MAX_MS);
+  const until = Date.now() + backoffMs;
   comboModelCooldowns.set(modelStr, until);
   return until;
+}
+
+// Clear a model's cooldown + consecutive-failure counter after a successful
+// call, so its next failure starts back at the base window.
+function resetComboModelFailure(modelStr) {
+  comboModelFailures.delete(modelStr);
+  comboModelCooldowns.delete(modelStr);
 }
 
 // Cooldown is a soft de-prioritization, not a hard skip. Models still inside
@@ -290,6 +307,19 @@ export function resetComboRotation(comboName) {
  */
 export function resetComboCooldowns() {
   comboModelCooldowns.clear();
+  comboModelFailures.clear();
+}
+
+/**
+ * Test-only: read the remaining cooldown window (ms) for a model, plus its
+ * current consecutive-failure count. 0/0 when the model is not cooling.
+ */
+export function getComboCooldownState(modelStr) {
+  const until = comboModelCooldowns.get(modelStr) || 0;
+  return {
+    remainingMs: Math.max(0, until - Date.now()),
+    failureCount: comboModelFailures.get(modelStr) || 0,
+  };
 }
 
 /**
@@ -402,6 +432,7 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
       
       // Success (2xx) - return response
       if (result.ok) {
+        resetComboModelFailure(modelStr);
         log.info("COMBO", `${comboLogPrefix} | Model ${modelStr} accepted stream`);
         logSummary(`success=${modelStr}`);
         return result;

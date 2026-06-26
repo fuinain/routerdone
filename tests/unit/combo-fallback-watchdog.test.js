@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
 
-import { handleComboChat, getRotatedModels, resetComboRotation, resetComboCooldowns } from "../../open-sse/services/combo.js";
+import { handleComboChat, getRotatedModels, resetComboRotation, resetComboCooldowns, getComboCooldownState } from "../../open-sse/services/combo.js";
 import { parseResetAfterText, parseRetryAfterHeader } from "../../open-sse/utils/error.js";
 import { guardInitialStream, isProductiveStreamChunk } from "../../open-sse/handlers/chatCore/streamingHandler.js";
 import { resolveRoutePolicy } from "../../open-sse/services/routePolicy.js";
@@ -149,6 +149,81 @@ describe("adaptive combo fallback", () => {
     expect(res.ok).toBe(true);
   });
 
+  it("escalates the cooldown exponentially on consecutive failures, capped", async () => {
+    const preflightFail = async () => new Response(
+      JSON.stringify({ error: { message: "upstream first productive timeout" } }),
+      { status: 502 },
+    );
+    const armOnce = () => handleComboChat({
+      body: { model: "combo", messages: [] },
+      models: ["p/a"],
+      comboName: "combo",
+      comboRetryAttempts: 0,
+      comboRetryDelayMs: 0,
+      log,
+      handleSingleModel: preflightFail,
+    });
+
+    await armOnce();
+    const s1 = getComboCooldownState("p/a");
+    expect(s1.failureCount).toBe(1);
+    // base window ~30s (allow slack for elapsed time during the call)
+    expect(s1.remainingMs).toBeGreaterThan(25_000);
+    expect(s1.remainingMs).toBeLessThanOrEqual(30_000);
+
+    await armOnce();
+    const s2 = getComboCooldownState("p/a");
+    expect(s2.failureCount).toBe(2);
+    // doubled: ~60s
+    expect(s2.remainingMs).toBeGreaterThan(50_000);
+    expect(s2.remainingMs).toBeLessThanOrEqual(60_000);
+
+    await armOnce();
+    const s3 = getComboCooldownState("p/a");
+    expect(s3.failureCount).toBe(3);
+    // doubled again: ~120s
+    expect(s3.remainingMs).toBeGreaterThan(100_000);
+    expect(s3.remainingMs).toBeLessThanOrEqual(120_000);
+
+    // Many more failures must saturate at the 30-minute cap, not grow unbounded.
+    for (let i = 0; i < 6; i++) await armOnce();
+    const sCap = getComboCooldownState("p/a");
+    expect(sCap.failureCount).toBe(9);
+    expect(sCap.remainingMs).toBeGreaterThan(29 * 60_000);
+    expect(sCap.remainingMs).toBeLessThanOrEqual(30 * 60_000);
+  });
+
+  it("resets the cooldown counter to base after one successful call", async () => {
+    const preflightFail = async () => new Response(
+      JSON.stringify({ error: { message: "upstream first productive timeout" } }),
+      { status: 502 },
+    );
+    const arm = (fn) => handleComboChat({
+      body: { model: "combo", messages: [] },
+      models: ["p/a"],
+      comboName: "combo",
+      comboRetryAttempts: 0,
+      comboRetryDelayMs: 0,
+      log,
+      handleSingleModel: fn,
+    });
+
+    await arm(preflightFail);
+    await arm(preflightFail);
+    expect(getComboCooldownState("p/a").failureCount).toBe(2);
+
+    // A 2xx clears both the counter and the active cooldown window.
+    const ok = await arm(async () => new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    expect(ok.ok).toBe(true);
+    expect(getComboCooldownState("p/a")).toEqual({ remainingMs: 0, failureCount: 0 });
+
+    // Next failure starts back at the base window, not the escalated one.
+    await arm(preflightFail);
+    const after = getComboCooldownState("p/a");
+    expect(after.failureCount).toBe(1);
+    expect(after.remainingMs).toBeGreaterThan(25_000);
+    expect(after.remainingMs).toBeLessThanOrEqual(30_000);
+  });
   it("emits combo summary counters", async () => {
     const infos = [];
     const summaryLog = { info: (_tag, msg) => infos.push(msg), warn: () => {}, debug: () => {} };
