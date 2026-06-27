@@ -37,9 +37,16 @@ export default function MitmServerCard({ apiKeys, cloudEnabled, onStatusChange }
           setMitmRouterBaseUrl(data.mitmRouterBaseUrl);
         }
         onStatusChange?.(data);
+      } else {
+        setStatus({
+          running: false,
+          certExists: false,
+          dnsStatus: {},
+          error: res.status === 403 ? "local_only" : "load_failed"
+        });
       }
     } catch {
-      setStatus({ running: false, certExists: false, dnsStatus: {} });
+      setStatus({ running: false, certExists: false, dnsStatus: {}, error: "network_error" });
     }
   }, [onStatusChange]);
 
@@ -162,6 +169,20 @@ export default function MitmServerCard({ apiKeys, cloudEnabled, onStatusChange }
             </div>
           </div>
 
+          {status?.error === "local_only" && (
+            <div className="flex items-start gap-2.5 p-3 rounded-lg bg-yellow-500/10 border border-yellow-500/30 text-yellow-600 dark:text-yellow-500 text-xs">
+              <span className="material-symbols-outlined text-[18px] shrink-0 mt-0.5">warning</span>
+              <div className="flex flex-col gap-1">
+                <span className="font-semibold">Local Access Only Required</span>
+                <span className="leading-relaxed">
+                  The MITM Server configures system-level DNS routing and trusts SSL certificates on your host machine. 
+                  If you are running RouterDone inside Docker, these system-level integrations are not supported. 
+                  Please run RouterDone natively on your PC to enable MITM proxy support.
+                </span>
+              </div>
+            </div>
+          )}
+
           {/* Purpose & How it works */}
           <div className="px-2 py-2 rounded-lg bg-surface/50 border border-border/50 flex flex-col gap-2">
             <p className="text-[11px] text-text-muted leading-relaxed">
@@ -214,7 +235,7 @@ export default function MitmServerCard({ apiKeys, cloudEnabled, onStatusChange }
             {!status?.certTrusted && (
               <button
                 onClick={() => handleAction("trust-cert")}
-                disabled={loading}
+                disabled={loading || status?.error === "local_only"}
                 className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-yellow-500/30 bg-yellow-500/10 px-4 py-2 text-xs font-medium text-yellow-600 transition-colors hover:bg-yellow-500/20 disabled:opacity-50 sm:w-auto sm:py-1.5"
               >
                 <span className="material-symbols-outlined text-[16px]">verified_user</span>
@@ -233,7 +254,7 @@ export default function MitmServerCard({ apiKeys, cloudEnabled, onStatusChange }
             ) : (
               <button
                 onClick={() => handleAction("start")}
-                disabled={loading || !status || (serverIsWindows && !isAdmin)}
+                disabled={loading || !status || status?.error === "local_only" || (serverIsWindows && !isAdmin)}
                 title={serverIsWindows && !isAdmin ? "Administrator required" : undefined}
                 className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-primary/30 bg-primary/10 px-4 py-2 text-xs font-medium text-primary transition-colors hover:bg-primary/20 disabled:opacity-50 sm:w-auto sm:py-1.5"
               >
